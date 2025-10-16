@@ -140,6 +140,14 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    // Grouped attention support: multiple Q groups sharing K,V loads
+    int num_groups;                          // Number of Q groups (e.g., 2 for early/late split)
+    int* group_q_offsets;                    // Device pointer: cumulative Q token offsets per group [g0_total_q, g1_total_q, ...]
+    int* group_max_seqlen_k;                 // Device pointer: max K,V length per group [tokens_early, tokens_late]
+    int** group_cu_seqlens_k;                // Device pointer: array of cu_seqlens_k pointers, one per group
+    void** group_o_ptrs;                     // Device pointer: array of output pointers, one per group
+    void** group_softmax_lse_ptrs;           // Device pointer: array of LSE pointers, one per group
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -188,6 +196,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_grouped_(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
 

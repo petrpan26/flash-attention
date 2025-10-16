@@ -1473,12 +1473,165 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     return {out, softmax_lse};
 }
+
+// Grouped flash attention: multiple Q groups sharing K,V loads
+std::vector<at::Tensor>
+mha_varlen_fwd_grouped(
+    const std::vector<at::Tensor> &q_list,  // List of Q tensors: [total_q_group0 x num_heads x head_size, ...]
+    const at::Tensor &k,                     // Shared K: total_k x num_heads_k x head_size
+    const at::Tensor &v,                     // Shared V: total_k x num_heads_k x head_size
+    const std::vector<at::Tensor> &cu_seqlens_q_list,  // List of cu_seqlens_q per group
+    const std::vector<at::Tensor> &cu_seqlens_k_list,  // List of cu_seqlens_k per group (different endpoints)
+    const std::vector<int> &max_seqlen_q_list,        // Max Q sequence lengths per group
+    const std::vector<int> &max_seqlen_k_list,        // Max K,V lengths per group (DIFFERENT!)
+    const float p_dropout,
+    const float softmax_scale,
+    const bool zero_tensors,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool return_softmax,
+    std::optional<at::Generator> gen_) {
+
+    at::cuda::CUDAGuard device_guard{q_list[0].device()};
+
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x_min = cc_major >= 8;
+    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+
+    const int num_groups = q_list.size();
+    TORCH_CHECK(num_groups > 0, "Must have at least one Q group");
+    TORCH_CHECK(cu_seqlens_q_list.size() == num_groups, "cu_seqlens_q_list size must match num_groups");
+    TORCH_CHECK(cu_seqlens_k_list.size() == num_groups, "cu_seqlens_k_list size must match num_groups");
+    TORCH_CHECK(max_seqlen_q_list.size() == num_groups, "max_seqlen_q_list size must match num_groups");
+    TORCH_CHECK(max_seqlen_k_list.size() == num_groups, "max_seqlen_k_list size must match num_groups");
+
+    auto q_dtype = q_list[0].dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    // Validate all Q tensors
+    for (int i = 0; i < num_groups; i++) {
+        TORCH_CHECK(q_list[i].dtype() == q_dtype, "All Q tensors must have same dtype");
+        CHECK_DEVICE(q_list[i]);
+        TORCH_CHECK(q_list[i].stride(-1) == 1, "Q tensor must have contiguous last dimension");
+        TORCH_CHECK(cu_seqlens_q_list[i].dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+        TORCH_CHECK(cu_seqlens_k_list[i].dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+        CHECK_DEVICE(cu_seqlens_q_list[i]);
+        CHECK_DEVICE(cu_seqlens_k_list[i]);
+        CHECK_CONTIGUOUS(cu_seqlens_q_list[i]);
+        CHECK_CONTIGUOUS(cu_seqlens_k_list[i]);
+    }
+
+    CHECK_DEVICE(k); CHECK_DEVICE(v);
+    TORCH_CHECK(k.stride(-1) == 1, "K tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "V tensor must have contiguous last dimension");
+
+    const auto sizes_q0 = q_list[0].sizes();
+    const int num_heads = sizes_q0[1];
+    const int head_size = sizes_q0[2];
+    const int num_heads_k = k.size(1);
+
+    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size % 8 == 0, "query, key, value must have a head_size that is a multiple of 8");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
+    if (is_causal) { window_size_right = 0; }
+
+    // Allocate outputs for each group
+    std::vector<at::Tensor> out_list;
+    std::vector<at::Tensor> softmax_lse_list;
+    auto opts = q_list[0].options();
+
+    for (int i = 0; i < num_groups; i++) {
+        at::Tensor out_i = torch::empty_like(q_list[i]);
+        if (zero_tensors) {
+            out_i.zero_();
+        }
+        out_list.push_back(out_i);
+
+        const int total_q_i = q_list[i].sizes()[0];
+        at::Tensor softmax_lse_i = torch::empty({num_heads, total_q_i}, opts.dtype(at::kFloat));
+        if (zero_tensors) {
+            softmax_lse_i.fill_(-std::numeric_limits<float>::infinity());
+        }
+        softmax_lse_list.push_back(softmax_lse_i);
+    }
+
+    // For now, fall back to calling varlen_fwd separately for each group
+    // This provides the correct API but doesn't yet optimize K,V sharing
+    // TODO: Implement true grouped kernel that shares K,V tiles across groups
+
+    std::vector<at::Tensor> results;
+    at::Tensor S_dmask, rng_state;
+
+    for (int i = 0; i < num_groups; i++) {
+        std::optional<at::Tensor> out_opt = out_list[i];
+        std::optional<at::Tensor> seqused_k_opt = std::nullopt;
+        std::optional<const at::Tensor> leftpad_k_opt = std::nullopt;
+        std::optional<at::Tensor> block_table_opt = std::nullopt;
+        std::optional<at::Tensor> alibi_slopes_opt = std::nullopt;
+
+        // Slice K,V to group-specific length
+        int k_end = cu_seqlens_k_list[i][cu_seqlens_k_list[i].numel() - 1].item<int>();
+        at::Tensor k_slice = k.index({torch::indexing::Slice(0, k_end)});
+        at::Tensor v_slice = v.index({torch::indexing::Slice(0, k_end)});
+
+        auto group_results = mha_varlen_fwd(
+            q_list[i],
+            k_slice,
+            v_slice,
+            out_opt,
+            cu_seqlens_q_list[i],
+            cu_seqlens_k_list[i],
+            seqused_k_opt,
+            leftpad_k_opt,
+            block_table_opt,
+            alibi_slopes_opt,
+            max_seqlen_q_list[i],
+            max_seqlen_k_list[i],
+            p_dropout,
+            softmax_scale,
+            zero_tensors,
+            is_causal,
+            window_size_left,
+            window_size_right,
+            softcap,
+            return_softmax && i == 0,  // Only return softmax for first group to save memory
+            gen_
+        );
+
+        // Store outputs
+        out_list[i] = group_results[0];
+        softmax_lse_list[i] = group_results[1];
+        if (i == 0) {
+            S_dmask = group_results[2];
+            rng_state = group_results[3];
+        }
+    }
+
+    // Pack results: [out0, lse0, out1, lse1, ..., S_dmask, rng_state]
+    for (int i = 0; i < num_groups; i++) {
+        results.push_back(out_list[i]);
+        results.push_back(softmax_lse_list[i]);
+    }
+    results.push_back(S_dmask);
+    results.push_back(rng_state);
+
+    return results;
+}
+
 } // namespace FLASH_NAMESPACE
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
     m.def("varlen_fwd", &FLASH_NAMESPACE::mha_varlen_fwd, "Forward pass (variable length)");
+    m.def("varlen_fwd_grouped", &FLASH_NAMESPACE::mha_varlen_fwd_grouped, "Forward pass (variable length, grouped)");
     m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
     m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
     m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");

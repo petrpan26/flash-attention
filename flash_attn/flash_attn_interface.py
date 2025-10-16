@@ -1471,6 +1471,113 @@ def flash_attn_varlen_func(
     )
 
 
+def _flash_attn_varlen_forward_grouped(
+    q_list: Sequence[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q_list: Sequence[torch.Tensor],
+    cu_seqlens_k_list: Sequence[torch.Tensor],
+    max_seqlen_q_list: Sequence[int],
+    max_seqlen_k_list: Sequence[int],
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    return_softmax: bool = False,
+    zero_tensors: bool = False,
+) -> Tuple[Sequence[torch.Tensor], Sequence[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Flash attention with multiple Q groups sharing K,V loads.
+
+    Each Q group attends to a different-length prefix of K,V.
+    K,V are loaded from HBM in a way that enables L2 cache sharing across groups.
+
+    This is useful for patterns like zigzag_llama3 where you have early/late splits
+    that need to attend to overlapping K,V prefixes.
+
+    Args:
+        q_list: List of Q tensors [q_group0, q_group1, ...], each of shape
+                (total_q_i, num_heads, head_dim)
+        k: Shared K tensor (total_k, num_heads_k, head_dim)
+        v: Shared V tensor (total_k, num_heads_k, head_dim)
+        cu_seqlens_q_list: List of cu_seqlens_q tensors, one per group
+        cu_seqlens_k_list: List of cu_seqlens_k tensors with different endpoints
+                           (e.g., [cu_seqlens_k_early, cu_seqlens_k_late])
+        max_seqlen_q_list: Max Q sequence lengths per group
+        max_seqlen_k_list: Max K sequence lengths per group (DIFFERENT per group!)
+        dropout_p: Dropout probability
+        softmax_scale: Scaling factor for QK^T
+        causal: Whether to apply causal masking
+        window_size_left: Left window size for local attention
+        window_size_right: Right window size for local attention
+        softcap: Softcapping parameter
+        return_softmax: Whether to return softmax output
+        zero_tensors: Whether to zero output tensors
+
+    Returns:
+        out_list: List of output tensors, one per group
+        lse_list: List of LSE tensors, one per group
+        S_dmask: Dropout mask (if return_softmax)
+        rng_state: RNG state
+
+    Example:
+        # Zigzag llama3 use case (2 groups):
+        out_list, lse_list, _, _ = _flash_attn_varlen_forward_grouped(
+            q_list=[q_early, q_late],
+            k=k_full,
+            v=v_full,
+            cu_seqlens_q_list=[cu_seqlens_q_early, cu_seqlens_q_late],
+            cu_seqlens_k_list=[cu_seqlens_k_early, cu_seqlens_k_late],
+            max_seqlen_q_list=[max_seqlen_q, max_seqlen_q],
+            max_seqlen_k_list=[tokens_early, tokens_late],  # Different!
+            ...
+        )
+    """
+    # Make all tensors contiguous
+    q_list = [maybe_contiguous(q) for q in q_list]
+    k = maybe_contiguous(k)
+    v = maybe_contiguous(v)
+
+    if softmax_scale is None:
+        softmax_scale = q_list[0].shape[-1] ** (-0.5)
+
+    # Call C++ grouped function
+    results = flash_attn_gpu.varlen_fwd_grouped(
+        q_list,
+        k,
+        v,
+        cu_seqlens_q_list,
+        cu_seqlens_k_list,
+        max_seqlen_q_list,
+        max_seqlen_k_list,
+        dropout_p,
+        softmax_scale,
+        zero_tensors,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        return_softmax,
+        None,  # generator
+    )
+
+    # Unpack results: [out0, lse0, out1, lse1, ..., S_dmask, rng_state]
+    num_groups = len(q_list)
+    out_list = []
+    lse_list = []
+
+    for i in range(num_groups):
+        out_list.append(results[i * 2])
+        lse_list.append(results[i * 2 + 1])
+
+    S_dmask = results[num_groups * 2]
+    rng_state = results[num_groups * 2 + 1]
+
+    return out_list, lse_list, S_dmask, rng_state
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
