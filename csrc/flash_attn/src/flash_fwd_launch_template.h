@@ -51,6 +51,15 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
     FLASH_NAMESPACE::combine_attn_seqk_parallel<Kernel_traits, kBlockM, Log_max_splits, Is_even_K>(params);
 }
 
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_grouped_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        static_assert(!(Is_causal && Is_local)); // Enforce constraints
+        FLASH_NAMESPACE::compute_attn_grouped<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params);
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -301,4 +310,59 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
     });
 }
+
+// Grouped flash attention kernel launcher
+// Launches a single kernel grid that processes multiple Q groups with shared K,V
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+void run_flash_fwd_grouped(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+
+    // Compute total number of Q blocks across all groups
+    int total_num_m_blocks = 0;
+    std::vector<int> group_m_block_offsets(params.num_groups + 1);
+    group_m_block_offsets[0] = 0;
+
+    for (int i = 0; i < params.num_groups; i++) {
+        int group_seqlen_q = params.group_cu_seqlens_q[i].numel() > 0
+            ? params.group_cu_seqlens_q[i][params.group_cu_seqlens_q[i].numel() - 1].item<int>()
+            : params.seqlen_q;
+        int num_m_blocks = (group_seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+        total_num_m_blocks += num_m_blocks;
+        group_m_block_offsets[i + 1] = total_num_m_blocks;
+    }
+
+    // Set up grid with total Q blocks across all groups
+    dim3 grid(total_num_m_blocks, params.b, params.h);
+
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool return_softmax = params.p_ptr != nullptr;
+
+    // For simplicity in Phase 2, we assume:
+    // - No local windowing
+    // - No alibi
+    // - No softcap
+    // These can be added later if needed
+
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+            // Use the new grouped kernel
+            auto kernel = &flash_fwd_grouped_kernel<Kernel_traits, Is_dropout, Is_causal,
+                                           false, // Is_local
+                                           false, // Has_alibi
+                                           false, // IsEvenMN - disabled for simplicity
+                                           IsEvenKConst,
+                                           false, // Is_softcap
+                                           ReturnSoftmaxConst && Is_dropout>;
+
+            if (smem_size >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+
+            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    });
+}
+
 }  // namespace FLASH_NAMESPACE

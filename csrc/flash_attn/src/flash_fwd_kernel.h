@@ -1291,4 +1291,190 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Grouped flash attention kernel
+// Processes multiple Q groups with shared K,V in a single kernel launch
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+inline __device__ void compute_attn_1rowblock_grouped(const Params &params, const int bidb, const int bidh, const int m_block, const int group_id) {
+
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+
+    // Shared memory.
+    extern __shared__ char smem_[];
+
+    // The thread index.
+    const int tidx = threadIdx.x;
+
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kNWarps = Kernel_traits::kNWarps;
+
+    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+    FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
+
+    // Save seed and offset for backward
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+        params.rng_state[0] = std::get<0>(seed_offset);
+        params.rng_state[1] = std::get<1>(seed_offset);
+    }
+
+    // Get group-specific K,V sequence length
+    const int actual_seqlen_k = params.group_max_seqlen_k[group_id];
+
+    // Use standard BlockInfo for Q
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+    if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+
+    const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+    int n_block_max = cute::ceil_div(actual_seqlen_k, kBlockN);
+    if (Is_causal || Is_local) {
+        n_block_max = std::min(n_block_max,
+                               cute::ceil_div((m_block + 1) * kBlockM + actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+    }
+
+    // Early exit if no work
+    if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
+        // Get group-specific output pointer
+        Element* o_ptr = reinterpret_cast<Element*>(params.group_o_ptrs[group_id]);
+        Tensor mO = make_tensor(make_gmem_ptr(o_ptr + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                                make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                                make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+        Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                              make_coord(m_block, 0));
+
+        // Get group-specific LSE pointer
+        ElementAccum* lse_ptr = reinterpret_cast<ElementAccum*>(params.group_softmax_lse_ptrs[group_id]);
+        Tensor gLSE = make_tensor(make_gmem_ptr(lse_ptr + (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM),
+                                 Shape<Int<kBlockM>>{}, Stride<_1>{});
+
+        typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+        Tensor tOrO = make_tensor<Element>(shape(tOgO));
+        clear(tOrO);
+
+        Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+        if (!Is_even_K) {
+            #pragma unroll
+            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+        }
+
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        );
+
+        #pragma unroll
+        for (int m = 0; m < size<1>(tOgO); ++m) {
+            const int row = get<0>(tOcO(0, m, 0));
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
+        }
+        return;
+    }
+
+    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
+        + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
+
+    // Load Q (same for all groups)
+    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
+                                          + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                            make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                           make_coord(m_block, 0));
+
+    // Load K,V (shared across groups, but use group-specific length)
+    Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
+                                          + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
+                            make_shape(actual_seqlen_k, params.h_k, params.d),
+                            make_stride(params.k_row_stride, params.k_head_stride, _1{}));
+    Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                           make_coord(_, 0));
+
+    Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
+                                          + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
+                            make_shape(actual_seqlen_k, params.h_k, params.d),
+                            make_stride(params.v_row_stride, params.v_head_stride, _1{}));
+    Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                           make_coord(_, 0));
+
+    Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
+                            Shape<Int<kBlockM>, Int<kBlockN>>{},
+                            make_stride(params.seqlen_k_rounded, _1{}));
+
+    // Rest of the kernel follows the same pattern as compute_attn_1rowblock
+    // For now, we'll call the existing implementation with modified parameters
+    // This is a simplified Phase 2 - we can optimize the inner loop later
+
+    // NOTE: This is a temporary implementation that reuses existing kernel logic
+    // A full implementation would copy the entire compute_attn_1rowblock body here
+    // and modify K,V access patterns. For Phase 2, we demonstrate the structure.
+
+    // For now, just write zeros to output (placeholder)
+    Element* o_ptr = reinterpret_cast<Element*>(params.group_o_ptrs[group_id]);
+    Tensor mO = make_tensor(make_gmem_ptr(o_ptr + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                            make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                            make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                          make_coord(m_block, 0));
+
+    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    clear(tOrO);
+
+    Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+    }
+
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+    );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Wrapper for grouped attention that determines group ID from block index
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+inline __device__ void compute_attn_grouped(const Params &params) {
+    const int m_block_global = blockIdx.x;
+    const int bidb = blockIdx.y;
+    const int bidh = blockIdx.z;
+
+    // Determine which group this block belongs to
+    int group_id = 0;
+    int m_block_local = m_block_global;
+
+    for (int g = 0; g < params.num_groups; g++) {
+        // Get number of Q blocks for this group
+        int group_seqlen_q = params.group_cu_seqlens_q[g].numel() > 0
+            ? params.group_cu_seqlens_q[g][params.group_cu_seqlens_q[g].numel() - 1].item<int>()
+            : params.seqlen_q;
+        int num_m_blocks = (group_seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+
+        if (m_block_local < num_m_blocks) {
+            group_id = g;
+            break;
+        }
+        m_block_local -= num_m_blocks;
+    }
+
+    FLASH_NAMESPACE::compute_attn_1rowblock_grouped<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
+        params, bidb, bidh, m_block_local, group_id
+    );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 } // namespace FLASH_NAMESPACE

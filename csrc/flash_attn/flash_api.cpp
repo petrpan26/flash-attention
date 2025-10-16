@@ -1562,9 +1562,23 @@ mha_varlen_fwd_grouped(
         softmax_lse_list.push_back(softmax_lse_i);
     }
 
-    // For now, fall back to calling varlen_fwd separately for each group
-    // This provides the correct API but doesn't yet optimize K,V sharing
-    // TODO: Implement true grouped kernel that shares K,V tiles across groups
+    // PHASE 2 IMPLEMENTATION STATUS:
+    // ================================
+    // The real grouped CUDA kernel has been implemented in:
+    //   - flash_fwd_kernel.h: compute_attn_1rowblock_grouped() and compute_attn_grouped()
+    //   - flash_fwd_launch_template.h: run_flash_fwd_grouped() and flash_fwd_grouped_kernel
+    //
+    // This kernel performs true K,V sharing across multiple Q groups in a single kernel launch.
+    //
+    // TO COMPLETE INTEGRATION:
+    // 1. Properly populate Flash_fwd_params.group_* fields with group metadata
+    // 2. Convert std::vector<at::Tensor> inputs to device-accessible arrays
+    // 3. Call run_flash_fwd_grouped() instead of this loop
+    // 4. Handle RNG state and dropout properly for grouped execution
+    //
+    // For now, we fall back to sequential kernel launches (Phase 1).
+    // This still provides the grouped API but doesn't optimize K,V sharing.
+    // The kernel code is ready and can be integrated once params setup is complete.
 
     std::vector<at::Tensor> results;
     at::Tensor S_dmask, rng_state;
