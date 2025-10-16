@@ -280,6 +280,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_grouped_hdim128_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_grouped_hdim128_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
