@@ -313,23 +313,10 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
 
 // Grouped flash attention kernel launcher
 // Launches a single kernel grid that processes multiple Q groups with shared K,V
+// NOTE: total_num_m_blocks must be pre-computed on host before calling this
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_fwd_grouped(Flash_fwd_params &params, cudaStream_t stream) {
+void run_flash_fwd_grouped(Flash_fwd_params &params, cudaStream_t stream, int total_num_m_blocks) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
-
-    // Compute total number of Q blocks across all groups
-    int total_num_m_blocks = 0;
-    std::vector<int> group_m_block_offsets(params.num_groups + 1);
-    group_m_block_offsets[0] = 0;
-
-    for (int i = 0; i < params.num_groups; i++) {
-        int group_seqlen_q = params.group_cu_seqlens_q[i].numel() > 0
-            ? params.group_cu_seqlens_q[i][params.group_cu_seqlens_q[i].numel() - 1].item<int>()
-            : params.seqlen_q;
-        int num_m_blocks = (group_seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-        total_num_m_blocks += num_m_blocks;
-        group_m_block_offsets[i + 1] = total_num_m_blocks;
-    }
 
     // Set up grid with total Q blocks across all groups
     dim3 grid(total_num_m_blocks, params.b, params.h);

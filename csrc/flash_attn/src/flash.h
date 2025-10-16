@@ -144,6 +144,7 @@ struct Flash_fwd_params : public Qkv_params {
     // Grouped attention support: multiple Q groups sharing K,V loads
     int num_groups;                          // Number of Q groups (e.g., 2 for early/late split)
     int* group_q_offsets;                    // Device pointer: cumulative Q token offsets per group [g0_total_q, g1_total_q, ...]
+    int* group_num_m_blocks;                 // Device pointer: number of M blocks per group [blocks_g0, blocks_g1, ...]
     int* group_max_seqlen_k;                 // Device pointer: max K,V length per group [tokens_early, tokens_late]
     int** group_cu_seqlens_k;                // Device pointer: array of cu_seqlens_k pointers, one per group
     void** group_o_ptrs;                     // Device pointer: array of output pointers, one per group

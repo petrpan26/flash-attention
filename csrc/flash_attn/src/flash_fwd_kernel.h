@@ -1408,36 +1408,271 @@ inline __device__ void compute_attn_1rowblock_grouped(const Params &params, cons
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
 
-    // Rest of the kernel follows the same pattern as compute_attn_1rowblock
-    // For now, we'll call the existing implementation with modified parameters
-    // This is a simplified Phase 2 - we can optimize the inner loop later
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+                            typename Kernel_traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+                            typename Kernel_traits::SmemLayoutKV{});
+    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
+    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
-    // NOTE: This is a temporary implementation that reuses existing kernel logic
-    // A full implementation would copy the entire compute_attn_1rowblock body here
-    // and modify K,V access patterns. For Phase 2, we demonstrate the structure.
+    typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
+    auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
-    // For now, just write zeros to output (placeholder)
+    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
+    Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
+    Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
+    Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+
+    typename Kernel_traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);
+    Tensor tSrK  = thr_mma.partition_fragment_B(sK);
+    Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);
+
+    Tensor tSgS  = thr_mma.partition_C(gP);
+
+    Tensor acc_o = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+
+    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
+    Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
+    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
+
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
+
+    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+    Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tQpQ); ++k) { tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d; }
+        #pragma unroll
+        for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
+    }
+
+    // Prologue: Load Q
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                       binfo.actual_seqlen_q - m_block * kBlockM);
+    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+
+    if (Kernel_traits::Share_Q_K_smem) {
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+        __syncthreads();
+    }
+
+    int n_block = n_block_max - 1;
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                       actual_seqlen_k - n_block * kBlockN);
+    cute::cp_async_fence();
+
+    if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
+        FLASH_NAMESPACE::cp_async_wait<1>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    }
+
+    clear(acc_o);
+
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+
+    const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+
+    constexpr int n_masking_steps = (!Is_causal && !Is_local)
+        ? 1
+        : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+    #pragma unroll
+    for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s);
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+
+        if (masking_step > 0) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        } else {
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV, actual_seqlen_k - n_block * kBlockN
+            );
+        }
+        cute::cp_async_fence();
+
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
+
+        if constexpr (Is_softcap){
+            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+        }
+
+        mask.template apply_mask<Is_causal, Is_even_MN>(
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+        );
+
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        if (n_block > n_block_min) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+        }
+
+        masking_step == 0
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
+        if (Return_softmax) {
+            Tensor rP_drop = make_fragment_like(rP);
+            cute::copy(rP, rP_drop);
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                rP_drop, block_row_idx, block_col_idx, kNWarps
+            );
+            cute::copy(rP_drop, tSgS);
+            tSgS.data() = tSgS.data() + (-kBlockN);
+        }
+        if (Is_dropout) {
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+        }
+
+        Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        if (n_masking_steps > 1 && n_block <= n_block_min) {
+            --n_block;
+            break;
+        }
+    }
+
+    // Non-masking iterations
+    for (; n_block >= n_block_min; --n_block) {
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s);
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        cute::cp_async_fence();
+
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
+        if constexpr (Is_softcap){
+            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+        }
+
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        if (n_block > n_block_min) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+        }
+
+        mask.template apply_mask</*Causal_mask=*/false>(
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+        );
+
+        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
+        if (Return_softmax) {
+            Tensor rP_drop = make_fragment_like(rP);
+            cute::copy(rP, rP_drop);
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                rP_drop, block_row_idx, block_col_idx, kNWarps
+            );
+            cute::copy(rP_drop, tSgS);
+            tSgS.data() = tSgS.data() + (-kBlockN);
+        }
+        if (Is_dropout) {
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+        }
+
+        Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    }
+
+    // Epilogue
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
+
+    Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
+    Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});
+    auto smem_tiled_copy_O = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
+    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
+
+    if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+
+    // Write to group-specific output
     Element* o_ptr = reinterpret_cast<Element*>(params.group_o_ptrs[group_id]);
     Tensor mO = make_tensor(make_gmem_ptr(o_ptr + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
                             make_stride(params.o_row_stride, params.o_head_stride, _1{}));
     Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                          make_coord(m_block, 0));
+                           make_coord(m_block, 0));
+
+    // Write to group-specific LSE
+    ElementAccum* lse_ptr = reinterpret_cast<ElementAccum*>(params.group_softmax_lse_ptrs[group_id]);
+    Tensor gLSE = make_tensor(make_gmem_ptr(lse_ptr + (bidb * params.h + bidh) * params.seqlen_q + m_block * kBlockM),
+                             Shape<Int<kBlockM>>{}, Stride<_1>{});
 
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-    Tensor tOrO = make_tensor<Element>(shape(tOgO));
-    clear(tOrO);
 
-    Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+    __syncthreads();
+
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+
+    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    Tensor taccOcO = thr_mma.partition_C(caccO);
+    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
+    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));
+    if (get<1>(taccOcO_row(0)) == 0) {
+        #pragma unroll
+        for (int mi = 0; mi < size(lse); ++mi) {
+            const int row = get<0>(taccOcO_row(mi));
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
+        }
+    }
+
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
     if (!Is_even_K) {
         #pragma unroll
         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
     }
-
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
         gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
     );
@@ -1452,22 +1687,18 @@ inline __device__ void compute_attn_grouped(const Params &params) {
     const int bidb = blockIdx.y;
     const int bidh = blockIdx.z;
 
-    // Determine which group this block belongs to
+    // Determine which group this block belongs to using device-side metadata
     int group_id = 0;
     int m_block_local = m_block_global;
 
     for (int g = 0; g < params.num_groups; g++) {
-        // Get number of Q blocks for this group
-        int group_seqlen_q = params.group_cu_seqlens_q[g].numel() > 0
-            ? params.group_cu_seqlens_q[g][params.group_cu_seqlens_q[g].numel() - 1].item<int>()
-            : params.seqlen_q;
-        int num_m_blocks = (group_seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+        int num_m_blocks_g = params.group_num_m_blocks[g];
 
-        if (m_block_local < num_m_blocks) {
+        if (m_block_local < num_m_blocks_g) {
             group_id = g;
             break;
         }
-        m_block_local -= num_m_blocks;
+        m_block_local -= num_m_blocks_g;
     }
 
     FLASH_NAMESPACE::compute_attn_1rowblock_grouped<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
