@@ -1323,7 +1323,12 @@ inline __device__ void compute_attn_1rowblock_grouped(const Params &params, cons
         params.rng_state[1] = std::get<1>(seed_offset);
     }
 
-    // Get group-specific K,V sequence length
+    // OPTIMIZATION: Unified K,V addressing for L2 cache reuse
+    // All groups must use the SAME tensor shape so they generate identical memory addresses
+    // The last group has the longest K,V sequence, use that as the unified extent
+    const int max_seqlen_k_all_groups = params.group_max_seqlen_k[params.num_groups - 1];
+
+    // Get group-specific K,V sequence length (for loop bounds only)
     const int actual_seqlen_k = params.group_max_seqlen_k[group_id];
 
     // Use standard BlockInfo for Q
@@ -1389,17 +1394,20 @@ inline __device__ void compute_attn_1rowblock_grouped(const Params &params, cons
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));
 
-    // Load K,V (shared across groups, but use group-specific length)
+    // OPTIMIZATION: Load K,V with UNIFIED tensor extent for L2 cache reuse
+    // Use max_seqlen_k_all_groups so all groups see the SAME tensor shape
+    // This makes them generate IDENTICAL memory addresses for the same tile indices
+    // Enabling L2 cache hits when different groups access overlapping K,V regions
     Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
                                           + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
-                            make_shape(actual_seqlen_k, params.h_k, params.d),
+                            make_shape(max_seqlen_k_all_groups, params.h_k, params.d),  // ← UNIFIED EXTENT
                             make_stride(params.k_row_stride, params.k_head_stride, _1{}));
     Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));
 
     Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
                                           + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
-                            make_shape(actual_seqlen_k, params.h_k, params.d),
+                            make_shape(max_seqlen_k_all_groups, params.h_k, params.d),  // ← UNIFIED EXTENT
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));

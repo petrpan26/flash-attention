@@ -352,4 +352,111 @@ void run_flash_fwd_grouped(Flash_fwd_params &params, cudaStream_t stream, int to
     });
 }
 
+// OPTIMIZATION: Cache-aware grouped flash attention kernel
+// Uses round-robin block scheduling to maximize L2 cache hit rate for K,V sharing
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_grouped_cache_aware_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, int max_m_blocks_per_group) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        static_assert(!(Is_causal && Is_local)); // Enforce constraints
+
+        // OPTIMIZATION 3: Round-robin block indexing for cache locality
+        // Instead of processing all blocks from group 0, then group 1, etc.,
+        // we interleave: group 0 block 0, group 1 block 0, group 2 block 0, group 0 block 1, ...
+        // This ensures Q blocks from different groups that access similar K,V regions
+        // execute close together, maximizing L2 cache hit rate
+
+        const int m_block_global = blockIdx.x;
+        const int num_groups = params.num_groups;
+
+        // Round-robin indexing: blockIdx maps to (m_block, group_id)
+        const int m_block = m_block_global / num_groups;
+        const int group_id = m_block_global % num_groups;
+
+        // Early exit if this group doesn't have this many m_blocks
+        if (m_block >= params.group_num_m_blocks[group_id]) {
+            return;
+        }
+
+        // Now process this Q block using the optimized grouped attention logic
+        const int bidb = blockIdx.y;
+        const int bidh = blockIdx.z;
+
+        FLASH_NAMESPACE::compute_attn_1rowblock_grouped<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
+            params, bidb, bidh, m_block, group_id
+        );
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
+// Cache-aware grouped flash attention launcher
+// Uses round-robin grid layout to ensure K,V tiles are reused across groups via L2 cache
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+void run_flash_fwd_grouped_cache_aware(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m, int max_m_blocks_per_group) {
+    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+
+    // Grid uses round-robin layout: (max_m_blocks_per_group * num_groups, batch, heads)
+    // This ensures blocks from different groups that need similar K,V tiles execute close together
+    dim3 grid(grid_size_m, params.b, params.h);
+
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool return_softmax = params.p_ptr != nullptr;
+
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+            // Use the cache-aware grouped kernel with round-robin indexing
+            auto kernel = &flash_fwd_grouped_cache_aware_kernel<Kernel_traits, Is_dropout, Is_causal,
+                                           false, // Is_local
+                                           false, // Has_alibi
+                                           false, // IsEvenMN - disabled for simplicity
+                                           IsEvenKConst,
+                                           false, // Is_softcap
+                                           ReturnSoftmaxConst && Is_dropout,
+                                           max_m_blocks_per_group>;
+
+            if (smem_size >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+
+            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    });
+}
+
+// Sequential grouped flash attention launcher for L2 cache reuse
+// Launches one kernel per group SEQUENTIALLY to enable L2 cache sharing
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+void run_flash_fwd_grouped_sequential(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m, int group_id) {
+    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+
+    // Grid for this single group
+    dim3 grid(grid_size_m, params.b, params.h);
+
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool return_softmax = params.p_ptr != nullptr;
+
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+            // Use cache-aware kernel but with sequential launch (only one group at a time)
+            auto kernel = &flash_fwd_grouped_cache_aware_kernel<Kernel_traits, Is_dropout, Is_causal,
+                                           false, // Is_local
+                                           false, // Has_alibi
+                                           false, // IsEvenMN
+                                           IsEvenKConst,
+                                           false, // Is_softcap
+                                           ReturnSoftmaxConst && Is_dropout,
+                                           1>;  // max_m_blocks_per_group=1 since we're sequential
+
+            if (smem_size >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+
+            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    });
+}
+
 }  // namespace FLASH_NAMESPACE
