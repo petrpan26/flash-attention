@@ -192,6 +192,105 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     bool deterministic;
     index_t dq_accum_split_stride;
+
+    // ============================================================================
+    // Grouped Attention Backward Pass Support
+    // ============================================================================
+    // Multiple Q groups share K,V loads during backward pass to compute gradients
+    // efficiently. Each group has separate Q, dO, O, dQ, LSE, and softmax_d, while
+    // K, V, dK, dV are shared across all groups.
+    //
+    // Memory Layout:
+    //   - All group pointer arrays are allocated in device memory
+    //   - Host code allocates arrays and copies pointers to device
+    //   - Kernel accesses via params.group_*_ptrs[group_id]
+    //
+    // Usage Example:
+    //   num_groups = 2 (e.g., early tokens vs late tokens)
+    //   group_do_ptrs[0] -> dO for group 0
+    //   group_do_ptrs[1] -> dO for group 1
+    //   dk_ptr -> shared dK output (accumulated from both groups)
+    //
+    // Gradient Flow:
+    //   For each K/V block n:
+    //     Load K[n], V[n] once (shared)
+    //     Initialize dK_accum = 0, dV_accum = 0
+    //     For each group g:
+    //       For each Q block m in group g:
+    //         Load Q_g[m], dO_g[m], O_g[m] (needed for recomputation)
+    //         Recompute S_g = Q_g[m] @ K[n]^T
+    //         Recompute P_g = softmax(S_g) using saved LSE_g[m]
+    //         Compute dP_g = dO_g[m] @ V[n]^T
+    //         Compute dS_g = P_g * (dP_g - softmax_d_g[m])
+    //         Accumulate dK += dS_g^T @ Q_g[m]  (shared accumulator)
+    //         Accumulate dV += P_g^T @ dO_g[m]  (shared accumulator)
+    //         Compute dQ_g[m] += dS_g @ K[n]    (per-group output)
+    //     Write accumulated dK[n], dV[n]
+    //
+    // Key Differences from Forward Pass:
+    //   - Forward: iterate K/V blocks for each Q block → accumulate O
+    //   - Backward: iterate Q blocks for each K/V block → accumulate dK/dV
+    //   - Forward: compute LSE for numerical stability
+    //   - Backward: use saved LSE to recompute attention probabilities P
+    //   - Forward: direct computation
+    //   - Backward: need softmax_d = sum(dO * O) for gradient through softmax
+    // ============================================================================
+
+    // Input gradients (per-group)
+    void** group_do_ptrs;               // Device pointer: [num_groups] array of dO pointers
+                                        // Each points to gradient w.r.t. output for one group
+                                        // Shape per group: [B, seqlen_q_group, H, D]
+                                        // Used in main backward kernel to compute dP = dO @ V^T
+
+    // Output gradients (per-group for dQ, shared for dK/dV)
+    void** group_dq_ptrs;               // Device pointer: [num_groups] array of dQ pointers
+                                        // Each points to gradient w.r.t. Q for one group
+                                        // Shape per group: [B, seqlen_q_group, H, D]
+                                        // Updated via: dQ_g[m] += dS_g @ K
+
+    // Note: dk_ptr and dv_ptr (already defined above) are SHARED across all groups
+    // They accumulate gradients from all groups:
+    //   dK = sum over groups g: dS_g^T @ Q_g
+    //   dV = sum over groups g: P_g^T @ dO_g
+    // Shape: [B, seqlen_k, H, D] (same K/V for all groups)
+
+    // Intermediate values (per-group)
+    void** group_dsoftmax_sum_ptrs;     // Device pointer: [num_groups] array of softmax_d pointers
+                                        // softmax_d[i] = sum_j(dO[i,j] * O[i,j]) for each query row
+                                        // Required for gradient through softmax: dS = P * (dP - softmax_d)
+                                        // Shape per group: [B, H, seqlen_q_rounded_group] or [H, total_q + 128*B]
+                                        // Computed by preprocessing kernel (compute_dot_do_o)
+                                        // Layout matches LSE for consistency (unpadded_lse flag)
+
+    // Accumulator buffers (per-group)
+    void** group_dq_accum_ptrs;         // Device pointer: [num_groups] array of dQ accumulator pointers
+                                        // Used in sequence-parallel and deterministic modes
+                                        // Stores fp32 gradients before final conversion to fp16/bf16
+                                        // Shape per group: [B, seqlen_q_rounded + 128*B, H, D]
+                                        // Padding (128*B) prevents false sharing in atomic operations
+                                        // If deterministic: each seqk split writes to separate region
+                                        // Converted to final dQ by convert_dQ kernel
+
+    // Intermediate buffers for hybrid approach (optional, may not be used)
+    void** group_dk_intermediate_ptrs;  // Device pointer: intermediate dK buffers [num_groups]
+                                        // Only used if implementing separate-then-sum strategy
+                                        // Each buffer: [B, seqlen_k, H, D] in fp32
+                                        // Final dK = sum over groups: dk_intermediate[g]
+                                        // Typically NULL - prefer direct accumulation in registers
+
+    void** group_dv_intermediate_ptrs;  // Device pointer: intermediate dV buffers [num_groups]
+                                        // Only used if implementing separate-then-sum strategy
+                                        // Each buffer: [B, seqlen_k, H, D] in fp32
+                                        // Final dV = sum over groups: dv_intermediate[g]
+                                        // Typically NULL - prefer direct accumulation in registers
+
+    // Note: The following group-specific metadata is inherited from Flash_fwd_params:
+    //   - num_groups: Number of Q groups
+    //   - group_q_ptrs: [num_groups] Q pointers (needed for dK computation)
+    //   - group_o_ptrs: [num_groups] O pointers (needed for softmax_d computation)
+    //   - group_cu_seqlens_q: [num_groups] cumulative sequence length pointers
+    //   - group_num_m_blocks: [num_groups] number of M blocks per group
+    //   - group_softmax_lse_ptrs: [num_groups] LSE pointers (from forward pass, for recomputing P)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -201,5 +300,6 @@ template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_splitkv_dispa
 template<typename T, int Headdim, bool Is_causal> void run_mha_fwd_grouped_(Flash_fwd_params &params, cudaStream_t stream);
 
 template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+template<typename T, int Headdim, bool Is_causal> void run_mha_bwd_grouped_(Flash_bwd_params &params, cudaStream_t stream);
 
 }  // namespace FLASH_NAMESPACE

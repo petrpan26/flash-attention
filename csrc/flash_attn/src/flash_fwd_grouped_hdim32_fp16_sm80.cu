@@ -1,5 +1,5 @@
 /************************************************************************************* * Copyright (c) 2024, Tri Dao.
- * Grouped flash attention kernel instantiation for bf16, headdim 128, sm80+
+ * Grouped flash attention kernel instantiation for fp16, headdim 32, sm80+
  ******************************************************************************/
 
 #include "flash_fwd_launch_template.h"
@@ -8,8 +8,8 @@
 namespace FLASH_NAMESPACE {
 
 template<>
-void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 128;
+void run_mha_fwd_grouped_<cutlass::half_t, 32, false>(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 32;
 
     int max_m_blocks_per_group = 0;
     std::vector<int> host_num_m_blocks(params.num_groups);
@@ -33,10 +33,10 @@ void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &par
 
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             if (is_sm8x) {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, Is_dropout, false>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, false>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, Is_dropout, false>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, false>(
                     params, stream, grid_size_m);
             }
         });
@@ -48,10 +48,10 @@ void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &par
 
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             if (is_sm8x) {
-                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, MAX_GROUPS_SMEM, Is_dropout, false>(
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, false>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, MAX_GROUPS_SMEM, Is_dropout, false>(
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, false>(
                     params, stream, grid_size_m);
             }
         });
@@ -62,19 +62,20 @@ void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &par
 
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             if (is_sm8x) {
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, Is_dropout, false>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, false>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, Is_dropout, false>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, false>(
                     params, stream, grid_size_m);
             }
         });
+
     }
 }
 
 template<>
-void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr static int Headdim = 128;
+void run_mha_fwd_grouped_<cutlass::half_t, 32, true>(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 32;
 
     int max_m_blocks_per_group = 0;
     std::vector<int> host_num_m_blocks(params.num_groups);
@@ -98,10 +99,10 @@ void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &para
 
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             if (is_sm8x) {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, true, cutlass::bfloat16_t>, Is_dropout, true>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, true>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, Is_dropout, true>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, true>(
                     params, stream, grid_size_m);
             }
         });
@@ -113,10 +114,10 @@ void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &para
 
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             if (is_sm8x) {
-                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, true, cutlass::bfloat16_t>, MAX_GROUPS_SMEM, Is_dropout, true>(
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, true>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, MAX_GROUPS_SMEM, Is_dropout, true>(
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, true>(
                     params, stream, grid_size_m);
             }
         });
@@ -127,13 +128,14 @@ void run_mha_fwd_grouped_<cutlass::bfloat16_t, 128, true>(Flash_fwd_params &para
 
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
             if (is_sm8x) {
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, true, cutlass::bfloat16_t>, Is_dropout, true>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, true>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::bfloat16_t>, Is_dropout, true>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, cutlass::half_t>, Is_dropout, true>(
                     params, stream, grid_size_m);
             }
         });
+
     }
 }
 

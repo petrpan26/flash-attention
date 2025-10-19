@@ -410,6 +410,32 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_2groups_smem_share_kernel, bool Is_dropout
     #endif
 }
 
+// SMEM K,V sharing kernel launcher for N groups (3-4)
+// Loads K,V once per tile and processes N groups sequentially within the same block
+// Generalizes the 2-group approach for maximum bandwidth reduction
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_ngroups_smem_kernel, int MAX_GROUPS, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        const int m_block_combined = blockIdx.x;
+        const int bidb = blockIdx.y;
+        const int bidh = blockIdx.z;
+
+        // Each block processes one Q tile from EACH group
+        // m_blocks_per_group array is stored in constant memory (part of params)
+        // For simplicity, we pass the same m_block index for all groups
+        // (they process corresponding Q positions)
+        int m_blocks_per_group[MAX_GROUPS];
+        for (int g = 0; g < params.num_groups && g < MAX_GROUPS; ++g) {
+            m_blocks_per_group[g] = m_block_combined;
+        }
+
+        FLASH_NAMESPACE::compute_attn_ngroups_smem_share<Kernel_traits, MAX_GROUPS, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
+            params, bidb, bidh, m_blocks_per_group
+        );
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd_2groups_smem_share(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
@@ -493,6 +519,62 @@ void run_flash_fwd_grouped_sequential(Flash_fwd_params &params, cudaStream_t str
         BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
             // Use cache-aware kernel but with sequential launch (only one group at a time)
             auto kernel = &flash_fwd_grouped_cache_aware_kernel<Kernel_traits, Is_dropout, Is_causal,
+                                           false, // Is_local
+                                           false, // Has_alibi
+                                           false, // IsEvenMN
+                                           IsEvenKConst,
+                                           false, // Is_softcap
+                                           ReturnSoftmaxConst && Is_dropout>;
+
+            if (smem_size >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+
+            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    });
+}
+
+// N-group SMEM sharing kernel for 3-4 groups
+// Processes N groups sequentially within each block, loading K,V tiles only once
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_ngroups_smem_kernel, int MAX_GROUPS, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        const int m_block_combined = blockIdx.x;
+        const int bidb = blockIdx.y;
+        const int bidh = blockIdx.z;
+
+        // Each block processes one Q tile from EACH of N groups
+        // All groups use the same m_block index (they process corresponding Q positions)
+        int m_blocks_per_group[MAX_GROUPS];
+        for (int g = 0; g < params.num_groups; ++g) {
+            m_blocks_per_group[g] = m_block_combined;
+        }
+
+        FLASH_NAMESPACE::compute_attn_ngroups_smem_share<Kernel_traits, MAX_GROUPS, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
+            params, bidb, bidh, m_blocks_per_group
+        );
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
+// Launcher for N-group SMEM sharing kernel
+template<typename Kernel_traits, int MAX_GROUPS, bool Is_dropout, bool Is_causal>
+void run_flash_fwd_ngroups_smem_share(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m) {
+    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+
+    // Grid: Each block processes one Q tile from EACH group
+    // So we only need grid_size_m blocks (not grid_size_m * num_groups)
+    dim3 grid(grid_size_m, params.b, params.h);
+
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool return_softmax = params.p_ptr != nullptr;
+
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+            auto kernel = &flash_fwd_ngroups_smem_kernel<Kernel_traits, MAX_GROUPS, Is_dropout, Is_causal,
                                            false, // Is_local
                                            false, // Has_alibi
                                            false, // IsEvenMN

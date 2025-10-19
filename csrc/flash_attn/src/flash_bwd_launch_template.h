@@ -305,4 +305,210 @@ void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
     });
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Grouped Backward Pass Launcher
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Grouped backward kernel wrapper
+DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_grouped_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        FLASH_NAMESPACE::compute_dq_dk_dv_grouped<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap>(params);
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
+// Launcher for grouped backward pass (hybrid approach)
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+void run_flash_bwd_grouped_hybrid(Flash_bwd_params &params, cudaStream_t stream) {
+    // Step 1: Preprocess - compute dot(dO, O) for each group
+    const int num_groups = params.num_groups;
+
+    // Launch preprocessing kernel for each group
+    for (int g = 0; g < num_groups; g++) {
+        // Create temporary params for this group
+        Flash_bwd_params group_params = params;
+        group_params.do_ptr = params.group_do_ptrs[g];
+        group_params.o_ptr = params.group_o_ptrs[g];
+        group_params.dsoftmax_sum = params.group_dsoftmax_sum_ptrs[g];
+        group_params.cu_seqlens_q = params.group_cu_seqlens_q[g];
+        group_params.seqlen_q = params.group_max_seqlen_k[g];  // Use group-specific seqlen
+
+        const int num_m_block_g = (group_params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+        dim3 grid_m_g(num_m_block_g, params.b, params.h);
+
+        flash_bwd_dot_do_o_kernel<true, Kernel_traits><<<grid_m_g, Kernel_traits::kNThreads, 0, stream>>>(group_params);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+
+    // Step 2: Main backward kernel - process all groups in parallel
+    // Each K/V block is processed once, accumulating gradients from all groups
+
+    // Calculate total number of K/V blocks across all groups
+    int total_n_blocks = 0;
+    for (int g = 0; g < num_groups; g++) {
+        int num_n_blocks_g = (params.group_max_seqlen_k[g] + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
+        total_n_blocks += num_n_blocks_g;
+    }
+
+    // Grid: (total_n_blocks, batch, heads)
+    // Each block determines which group it belongs to based on block index
+    dim3 grid_grouped(total_n_blocks, params.b, params.h);
+
+    const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr
+                            && params.seqlen_q % Kernel_traits::kBlockM == 0
+                            && params.seqlen_k % Kernel_traits::kBlockN == 0;
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    constexpr int smem_size_dq_dk_dv = Kernel_traits::kSmemSize1colblock;
+
+    BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+        EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+            LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !params.is_causal, Is_local, [&] {
+                ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
+                    SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
+                        auto kernel = &flash_bwd_dq_dk_dv_grouped_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap>;
+
+                        if (smem_size_dq_dk_dv >= 48 * 1024) {
+                            C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                        }
+
+                        kernel<<<grid_grouped, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
+                        C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    });
+                });
+            });
+        });
+    });
+
+    // Step 3: Convert dQ accumulator to final dQ for each group
+    for (int g = 0; g < num_groups; g++) {
+        Flash_bwd_params group_params = params;
+        group_params.dq_ptr = params.group_dq_ptrs[g];
+        group_params.dq_accum_ptr = params.group_dq_accum_ptrs ? params.group_dq_accum_ptrs[g] : nullptr;
+        group_params.cu_seqlens_q = params.group_cu_seqlens_q[g];
+        group_params.seqlen_q = params.group_max_seqlen_k[g];
+
+        if (group_params.dq_accum_ptr != nullptr) {
+            const int num_m_block_g = (group_params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
+            dim3 grid_m_g(num_m_block_g, params.b, params.h);
+
+            auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
+            if (Kernel_traits::kSmemdQSize >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel_dq, cudaFuncAttributeMaxDynamicSharedMemorySize, Kernel_traits::kSmemdQSize));
+            }
+            kernel_dq<<<grid_m_g, Kernel_traits::kNThreads, Kernel_traits::kSmemdQSize, stream>>>(group_params, 1);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }
+    }
+}
+
+// Template instantiation dispatchers for grouped backward
+template<typename T, bool Is_causal>
+void run_mha_bwd_grouped_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 32;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+    });
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_grouped_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 64;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+        C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 144 * 1024) {
+            run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
+    });
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_grouped_hdim96(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 96;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+    });
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_grouped_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 128;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+        C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 144 * 1024) {
+            run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
+    });
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_grouped_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 192;
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+    });
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_grouped_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 256;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+        C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 176 * 1024) {
+            run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else if (max_smem_per_block >= 144 * 1024) {
+            run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, true, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            if constexpr (!Is_dropout) {
+                run_flash_bwd_grouped_hybrid<Flash_bwd_kernel_traits<Headdim, 64, 32, 8, 4, 1, 2, true, true, T>, false, Is_causal>(params, stream);
+            }
+        }
+    });
+}
+
+// Main dispatcher for grouped backward pass
+template<typename T, int Headdim, bool Is_causal>
+void run_mha_bwd_grouped_(Flash_bwd_params &params, cudaStream_t stream) {
+    if constexpr (Headdim == 32) {
+        run_mha_bwd_grouped_hdim32<T, Is_causal>(params, stream);
+    } else if constexpr (Headdim == 64) {
+        run_mha_bwd_grouped_hdim64<T, Is_causal>(params, stream);
+    } else if constexpr (Headdim == 96) {
+        run_mha_bwd_grouped_hdim96<T, Is_causal>(params, stream);
+    } else if constexpr (Headdim == 128) {
+        run_mha_bwd_grouped_hdim128<T, Is_causal>(params, stream);
+    } else if constexpr (Headdim == 192) {
+        run_mha_bwd_grouped_hdim192<T, Is_causal>(params, stream);
+    } else if constexpr (Headdim == 256) {
+        run_mha_bwd_grouped_hdim256<T, Is_causal>(params, stream);
+    }
+}
+
 } // namespace FLASH_NAMESPACE {

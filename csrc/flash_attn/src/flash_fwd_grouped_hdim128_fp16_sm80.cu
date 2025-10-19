@@ -23,71 +23,53 @@ void run_mha_fwd_grouped_<cutlass::half_t, 128, false>(Flash_fwd_params &params,
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
 
-
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
 
-
-
-    // OPTIMIZATION: Use SMEM K,V sharing kernel for exactly 2 groups
-
+    // OPTIMIZATION: Use SMEM K,V sharing kernel for 2-4 groups
+    constexpr int MAX_GROUPS_SMEM = 4;  // Support up to 4 groups in SMEM mode
 
     if (params.num_groups == 2) {
-
-
         // Grid size is just max_m_blocks (each block processes both groups)
-
-
         int grid_size_m = max_m_blocks_per_group;
 
-
-
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-
-
             if (is_sm8x) {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, cutlass::half_t>, Is_dropout, false>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, Is_dropout, false>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, cutlass::half_t>, Is_dropout, false>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, Is_dropout, false>(
                     params, stream, grid_size_m);
             }
-
-
         });
 
+    } else if (params.num_groups <= MAX_GROUPS_SMEM) {
+        // Use N-group SMEM sharing kernel for 3-4 groups
+        // Grid size is just max_m_blocks (each block processes all groups)
+        int grid_size_m = max_m_blocks_per_group;
+
+        DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+            if (is_sm8x) {
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, false>(
+                    params, stream, grid_size_m);
+            } else {
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, false>(
+                    params, stream, grid_size_m);
+            }
+        });
 
     } else {
-
-
-        // Use L2 cache-aware round-robin kernel for 3+ groups
-
-
+        // Use L2 cache-aware round-robin kernel for 5+ groups
         int grid_size_m = max_m_blocks_per_group * params.num_groups;
 
-
-
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-
-
             if (is_sm8x) {
-
-
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, cutlass::half_t>, Is_dropout, false>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, Is_dropout, false>(
                 params, stream, grid_size_m);
-
-
             } else {
-
-
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, cutlass::half_t>, Is_dropout, false>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, Is_dropout, false>(
                 params, stream, grid_size_m);
-
-
             }
-
-
         });
-
 
     }
 }
@@ -113,66 +95,51 @@ void run_mha_fwd_grouped_<cutlass::half_t, 128, true>(Flash_fwd_params &params, 
 
 
 
-    // OPTIMIZATION: Use SMEM K,V sharing kernel for exactly 2 groups
-
+    // OPTIMIZATION: Use SMEM K,V sharing kernel for 2-4 groups
+    constexpr int MAX_GROUPS_SMEM = 4;  // Support up to 4 groups in SMEM mode
 
     if (params.num_groups == 2) {
-
-
         // Grid size is just max_m_blocks (each block processes both groups)
-
-
         int grid_size_m = max_m_blocks_per_group;
 
-
-
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-
-
             if (is_sm8x) {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, cutlass::half_t>, Is_dropout, true>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, true, cutlass::half_t>, Is_dropout, true>(
                     params, stream, grid_size_m);
             } else {
-                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, cutlass::half_t>, Is_dropout, true>(
+                run_flash_fwd_2groups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, Is_dropout, true>(
                     params, stream, grid_size_m);
             }
-
-
         });
 
+    } else if (params.num_groups <= MAX_GROUPS_SMEM) {
+        // Use N-group SMEM sharing kernel for 3-4 groups
+        // Grid size is just max_m_blocks (each block processes all groups)
+        int grid_size_m = max_m_blocks_per_group;
+
+        DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+            if (is_sm8x) {
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, true, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, true>(
+                    params, stream, grid_size_m);
+            } else {
+                run_flash_fwd_ngroups_smem_share<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, MAX_GROUPS_SMEM, Is_dropout, true>(
+                    params, stream, grid_size_m);
+            }
+        });
 
     } else {
-
-
-        // Use L2 cache-aware round-robin kernel for 3+ groups
-
-
+        // Use L2 cache-aware round-robin kernel for 5+ groups
         int grid_size_m = max_m_blocks_per_group * params.num_groups;
 
-
-
         DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-
-
             if (is_sm8x) {
-
-
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, cutlass::half_t>, Is_dropout, true>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, true, true, cutlass::half_t>, Is_dropout, true>(
                 params, stream, grid_size_m);
-
-
             } else {
-
-
-                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, cutlass::half_t>, Is_dropout, true>(
+                run_flash_fwd_grouped_cache_aware<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, true, true, cutlass::half_t>, Is_dropout, true>(
                 params, stream, grid_size_m);
-
-
             }
-
-
         });
-
 
     }
 }

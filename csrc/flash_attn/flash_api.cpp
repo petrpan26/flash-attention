@@ -1716,6 +1716,280 @@ mha_varlen_fwd_grouped(
     return results;
 }
 
+// Grouped flash attention backward pass: multiple Q groups sharing K,V loads
+std::vector<at::Tensor>
+mha_varlen_bwd_grouped(
+    const std::vector<at::Tensor> &dout_list,          // dL/dO for each group [num_groups]
+    const std::vector<at::Tensor> &q_list,             // Q for each group [num_groups]
+    const at::Tensor &k,                                // Shared K tensor
+    const at::Tensor &v,                                // Shared V tensor
+    const std::vector<at::Tensor> &out_list,           // Forward outputs O for each group
+    const std::vector<at::Tensor> &softmax_lse_list,   // Forward LSE for each group
+    const std::vector<at::Tensor> &cu_seqlens_q_list,  // cu_seqlens_q per group
+    const std::vector<at::Tensor> &cu_seqlens_k_list,  // cu_seqlens_k per group
+    const std::vector<int> &max_seqlen_q_list,         // Max Q lengths per group
+    const std::vector<int> &max_seqlen_k_list,         // Max K,V lengths per group
+    const float p_dropout,
+    const float softmax_scale,
+    const bool zero_tensors,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    const bool deterministic,
+    std::optional<at::Generator> gen_) {
+
+    #ifdef FLASHATTENTION_DISABLE_BACKWARD
+        TORCH_CHECK(false, "This flash attention build does not support backward.");
+    #endif
+
+    if (is_causal) { window_size_right = 0; }
+
+    at::cuda::CUDAGuard device_guard{q_list[0].device()};
+
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x_min = cc_major >= 8;
+    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+
+    const int num_groups = q_list.size();
+    TORCH_CHECK(num_groups > 0, "Must have at least one Q group");
+    TORCH_CHECK(dout_list.size() == num_groups, "dout_list size must match num_groups");
+    TORCH_CHECK(out_list.size() == num_groups, "out_list size must match num_groups");
+    TORCH_CHECK(softmax_lse_list.size() == num_groups, "softmax_lse_list size must match num_groups");
+    TORCH_CHECK(cu_seqlens_q_list.size() == num_groups, "cu_seqlens_q_list size must match num_groups");
+    TORCH_CHECK(cu_seqlens_k_list.size() == num_groups, "cu_seqlens_k_list size must match num_groups");
+    TORCH_CHECK(max_seqlen_q_list.size() == num_groups, "max_seqlen_q_list size must match num_groups");
+    TORCH_CHECK(max_seqlen_k_list.size() == num_groups, "max_seqlen_k_list size must match num_groups");
+
+    auto q_dtype = q_list[0].dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    // Validate all tensors
+    for (int i = 0; i < num_groups; i++) {
+        TORCH_CHECK(q_list[i].dtype() == q_dtype, "All Q tensors must have same dtype");
+        TORCH_CHECK(dout_list[i].dtype() == q_dtype, "All dout tensors must have same dtype");
+        TORCH_CHECK(out_list[i].dtype() == q_dtype, "All out tensors must have same dtype");
+        CHECK_DEVICE(q_list[i]); CHECK_DEVICE(dout_list[i]); CHECK_DEVICE(out_list[i]);
+        CHECK_DEVICE(softmax_lse_list[i]); CHECK_DEVICE(cu_seqlens_q_list[i]); CHECK_DEVICE(cu_seqlens_k_list[i]);
+        TORCH_CHECK(q_list[i].stride(-1) == 1, "Q tensor must have contiguous last dimension");
+        TORCH_CHECK(dout_list[i].stride(-1) == 1, "dout tensor must have contiguous last dimension");
+        TORCH_CHECK(out_list[i].stride(-1) == 1, "out tensor must have contiguous last dimension");
+        CHECK_CONTIGUOUS(cu_seqlens_q_list[i]);
+        CHECK_CONTIGUOUS(cu_seqlens_k_list[i]);
+    }
+
+    CHECK_DEVICE(k); CHECK_DEVICE(v);
+    TORCH_CHECK(k.stride(-1) == 1, "K tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "V tensor must have contiguous last dimension");
+
+    const auto sizes_q0 = q_list[0].sizes();
+    const int num_heads = sizes_q0[1];
+    const int head_size = sizes_q0[2];
+    const int num_heads_k = k.size(1);
+
+    TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
+    TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64);
+
+    // Find max seqlen across all groups
+    int max_seqlen_q_global = *std::max_element(max_seqlen_q_list.begin(), max_seqlen_q_list.end());
+    int max_seqlen_k_global = *std::max_element(max_seqlen_k_list.begin(), max_seqlen_k_list.end());
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q_global, 128);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k_global, 128);
+
+    if (window_size_left >= max_seqlen_k_global) { window_size_left = -1; }
+    if (window_size_right >= max_seqlen_k_global) { window_size_right = -1; }
+
+    // Allocate output dQ tensors (one per group)
+    std::vector<at::Tensor> dq_list;
+    auto opts = q_list[0].options();
+    for (int i = 0; i < num_groups; i++) {
+        at::Tensor dq_i = torch::empty_like(q_list[i]);
+        if (zero_tensors) {
+            dq_i.zero_();
+        }
+        dq_list.push_back(dq_i);
+    }
+
+    // Allocate intermediate dK, dV buffers (one per group)
+    std::vector<at::Tensor> dk_intermediate_list;
+    std::vector<at::Tensor> dv_intermediate_list;
+    for (int i = 0; i < num_groups; i++) {
+        dk_intermediate_list.push_back(torch::zeros_like(k));
+        dv_intermediate_list.push_back(torch::zeros_like(v));
+    }
+
+    // Allocate softmax_d tensors for each group
+    std::vector<at::Tensor> softmax_d_list;
+    for (int i = 0; i < num_groups; i++) {
+        int total_q_i = q_list[i].size(0);
+        int batch_size_i = cu_seqlens_q_list[i].numel() - 1;
+        auto softmax_d_i = torch::empty({num_heads, total_q_i + 128 * batch_size_i}, opts.dtype(at::kFloat));
+        if (zero_tensors) {
+            softmax_d_i.zero_();
+        }
+        softmax_d_list.push_back(softmax_d_i);
+    }
+
+    // Allocate device arrays for group metadata
+    void** d_group_q_ptrs;
+    void** d_group_do_ptrs;
+    void** d_group_o_ptrs;
+    void** d_group_lse_ptrs;
+    void** d_group_dq_ptrs;
+    void** d_group_dsoftmax_sum_ptrs;
+    void** d_group_dk_intermediate_ptrs;
+    void** d_group_dv_intermediate_ptrs;
+    int** d_group_cu_seqlens_q;
+    int** d_group_cu_seqlens_k;
+    int* d_group_max_seqlen_k;
+
+    cudaMalloc(&d_group_q_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_do_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_o_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_lse_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_dq_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_dsoftmax_sum_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_dk_intermediate_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_dv_intermediate_ptrs, num_groups * sizeof(void*));
+    cudaMalloc(&d_group_cu_seqlens_q, num_groups * sizeof(int*));
+    cudaMalloc(&d_group_cu_seqlens_k, num_groups * sizeof(int*));
+    cudaMalloc(&d_group_max_seqlen_k, num_groups * sizeof(int));
+
+    // Prepare host arrays
+    std::vector<void*> h_group_q_ptrs(num_groups);
+    std::vector<void*> h_group_do_ptrs(num_groups);
+    std::vector<void*> h_group_o_ptrs(num_groups);
+    std::vector<void*> h_group_lse_ptrs(num_groups);
+    std::vector<void*> h_group_dq_ptrs(num_groups);
+    std::vector<void*> h_group_dsoftmax_sum_ptrs(num_groups);
+    std::vector<void*> h_group_dk_intermediate_ptrs(num_groups);
+    std::vector<void*> h_group_dv_intermediate_ptrs(num_groups);
+    std::vector<int*> h_group_cu_seqlens_q(num_groups);
+    std::vector<int*> h_group_cu_seqlens_k(num_groups);
+    std::vector<int> h_group_max_seqlen_k(num_groups);
+
+    for (int i = 0; i < num_groups; i++) {
+        h_group_q_ptrs[i] = q_list[i].data_ptr();
+        h_group_do_ptrs[i] = dout_list[i].data_ptr();
+        h_group_o_ptrs[i] = out_list[i].data_ptr();
+        h_group_lse_ptrs[i] = softmax_lse_list[i].data_ptr();
+        h_group_dq_ptrs[i] = dq_list[i].data_ptr();
+        h_group_dsoftmax_sum_ptrs[i] = softmax_d_list[i].data_ptr();
+        h_group_dk_intermediate_ptrs[i] = dk_intermediate_list[i].data_ptr();
+        h_group_dv_intermediate_ptrs[i] = dv_intermediate_list[i].data_ptr();
+        h_group_cu_seqlens_q[i] = cu_seqlens_q_list[i].data_ptr<int>();
+        h_group_cu_seqlens_k[i] = cu_seqlens_k_list[i].data_ptr<int>();
+        h_group_max_seqlen_k[i] = max_seqlen_k_list[i];
+    }
+
+    // Copy to device
+    cudaMemcpy(d_group_q_ptrs, h_group_q_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_do_ptrs, h_group_do_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_o_ptrs, h_group_o_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_lse_ptrs, h_group_lse_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_dq_ptrs, h_group_dq_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_dsoftmax_sum_ptrs, h_group_dsoftmax_sum_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_dk_intermediate_ptrs, h_group_dk_intermediate_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_dv_intermediate_ptrs, h_group_dv_intermediate_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_cu_seqlens_q, h_group_cu_seqlens_q.data(), num_groups * sizeof(int*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_cu_seqlens_k, h_group_cu_seqlens_k.data(), num_groups * sizeof(int*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_group_max_seqlen_k, h_group_max_seqlen_k.data(), num_groups * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Setup Flash_bwd_params
+    Flash_bwd_params params;
+    // We set up a "template" params with group 0's data, the kernel will override per-group
+    set_params_dgrad(params,
+                     /*batch_size=*/1,  // Varlen, batch handled via cu_seqlens
+                     max_seqlen_q_list[0],
+                     max_seqlen_k_global,
+                     seqlen_q_rounded,
+                     seqlen_k_rounded,
+                     num_heads,
+                     num_heads_k,
+                     head_size,
+                     head_size_rounded,
+                     q_list[0], k, v, out_list[0],
+                     dout_list[0], dq_list[0], dk_intermediate_list[0], dv_intermediate_list[0],
+                     cu_seqlens_q_list[0].data_ptr(),
+                     cu_seqlens_k_list[0].data_ptr(),
+                     /*dq_accum=*/nullptr,  // Not used in sequential grouped version
+                     /*dk_accum=*/nullptr,
+                     /*dv_accum=*/nullptr,
+                     softmax_lse_list[0].data_ptr(),
+                     softmax_d_list[0].data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     window_size_left,
+                     window_size_right,
+                     softcap,
+                     deterministic,
+                     /*unpadded_lse=*/true);
+
+    params.total_q = q_list[0].size(0);  // Will be updated per group
+
+    // Set grouped-specific fields
+    params.num_groups = num_groups;
+    params.group_q_ptrs = d_group_q_ptrs;
+    params.group_do_ptrs = d_group_do_ptrs;
+    params.group_o_ptrs = d_group_o_ptrs;
+    params.group_softmax_lse_ptrs = d_group_lse_ptrs;
+    params.group_dq_ptrs = d_group_dq_ptrs;
+    params.group_dsoftmax_sum_ptrs = d_group_dsoftmax_sum_ptrs;
+    params.group_dk_intermediate_ptrs = d_group_dk_intermediate_ptrs;
+    params.group_dv_intermediate_ptrs = d_group_dv_intermediate_ptrs;
+    params.group_cu_seqlens_q = d_group_cu_seqlens_q;
+    params.group_cu_seqlens_k = d_group_cu_seqlens_k;
+    params.group_max_seqlen_k = d_group_max_seqlen_k;
+
+    // Get stream
+    at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+
+    // Allocate final shared dK, dV tensors
+    at::Tensor dk = torch::zeros_like(k);
+    at::Tensor dv = torch::zeros_like(v);
+
+    // Update params to point to final dK, dV
+    params.dk_ptr = dk.data_ptr();
+    params.dv_ptr = dv.data_ptr();
+
+    // Dispatch to grouped backward kernel based on dtype and head dimension
+    FP16_SWITCH(q_dtype == torch::kFloat16, [&] {
+        HEADDIM_SWITCH(head_size, [&] {
+            BOOL_SWITCH(is_causal, Is_causal, [&] {
+                run_mha_bwd_grouped_<elem_type, kHeadDim, Is_causal>(params, stream.stream());
+            });
+        });
+    });
+
+    // Cleanup device memory
+    cudaFree(d_group_q_ptrs);
+    cudaFree(d_group_do_ptrs);
+    cudaFree(d_group_o_ptrs);
+    cudaFree(d_group_lse_ptrs);
+    cudaFree(d_group_dq_ptrs);
+    cudaFree(d_group_dsoftmax_sum_ptrs);
+    cudaFree(d_group_dk_intermediate_ptrs);
+    cudaFree(d_group_dv_intermediate_ptrs);
+    cudaFree(d_group_cu_seqlens_q);
+    cudaFree(d_group_cu_seqlens_k);
+    cudaFree(d_group_max_seqlen_k);
+
+    // Return [dq0, dq1, ..., dqN, dk, dv]
+    std::vector<at::Tensor> results = dq_list;
+    results.push_back(dk);
+    results.push_back(dv);
+    return results;
+}
+
 } // namespace FLASH_NAMESPACE
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1725,5 +1999,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("varlen_fwd_grouped", &FLASH_NAMESPACE::mha_varlen_fwd_grouped, "Forward pass (variable length, grouped)");
     m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
     m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
+    m.def("varlen_bwd_grouped", &FLASH_NAMESPACE::mha_varlen_bwd_grouped, "Backward pass (variable length, grouped)");
     m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
 }

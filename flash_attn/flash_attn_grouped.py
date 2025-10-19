@@ -5,7 +5,8 @@
 
 from typing import List, Optional, Tuple
 import torch
-from .flash_attn_interface import _flash_attn_varlen_forward
+from .flash_attn_interface import _flash_attn_varlen_forward, _flash_attn_varlen_backward
+import flash_attn_2_cuda as flash_attn_cuda
 
 
 def _flash_attn_varlen_forward_grouped(
@@ -151,3 +152,129 @@ def _flash_attn_varlen_forward_grouped(
         rng_state = rng_state_group
 
     return out_list, lse_list, S_dmask, rng_state
+
+
+def _flash_attn_varlen_backward_grouped(
+    dout_list: List[torch.Tensor],
+    q_list: List[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out_list: List[torch.Tensor],
+    softmax_lse_list: List[torch.Tensor],
+    cu_seqlens_q_list: List[torch.Tensor],
+    cu_seqlens_k_list: List[torch.Tensor],
+    max_seqlen_q_list: List[int],
+    max_seqlen_k_list: List[int],
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = True,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    rng_state: Optional[torch.Tensor] = None,
+) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Flash attention backward pass with multiple Q groups sharing K,V loads.
+
+    This function computes gradients for grouped flash attention, where multiple Q groups
+    share the same K,V tensors. Each group can attend to different-length prefixes of K,V.
+
+    The key optimization is that dK and dV are accumulated across all groups, reducing
+    redundant gradient computations.
+
+    Args:
+        dout_list: List of gradient tensors w.r.t. outputs [total_q_tokens, nheads, head_dim] per group
+        q_list: List of Q tensors, one per group [total_q_tokens, nheads, head_dim]
+        k: Shared K tensor [total_k_tokens, nheads_k, head_dim]
+        v: Shared V tensor [total_k_tokens, nheads_k, head_dim]
+        out_list: List of forward pass outputs, one per group
+        softmax_lse_list: List of LSE tensors from forward pass, one per group
+        cu_seqlens_q_list: List of cu_seqlens_q tensors, one per group
+        cu_seqlens_k_list: List of cu_seqlens_k tensors, one per group
+        max_seqlen_q_list: List of max Q sequence lengths, one per group
+        max_seqlen_k_list: List of max K,V lengths per group (can be different!)
+        dropout_p: Dropout probability
+        softmax_scale: Scaling factor for softmax. If None, uses 1/sqrt(head_dim)
+        causal: Whether to apply causal masking
+        window_size_left: Left window size for sliding window attention (-1 = infinite)
+        window_size_right: Right window size for sliding window attention (-1 = infinite)
+        softcap: Softcap value (<=0.0 means deactivated)
+        alibi_slopes: ALiBi slopes tensor
+        deterministic: Whether to use deterministic implementation
+        rng_state: RNG state from forward pass (for dropout)
+
+    Returns:
+        dq_list: List of gradient tensors w.r.t. Q, one per group [q_tokens, nheads, head_dim]
+        dk: Gradient tensor w.r.t. K [total_k_tokens, nheads_k, head_dim]
+        dv: Gradient tensor w.r.t. V [total_k_tokens, nheads_k, head_dim]
+
+    Example:
+        # Two groups with different K,V lengths
+        dout_early = torch.randn_like(out_early)
+        dout_late = torch.randn_like(out_late)
+
+        dq_list, dk, dv = _flash_attn_varlen_backward_grouped(
+            dout_list=[dout_early, dout_late],
+            q_list=[q_early, q_late],
+            k=k,
+            v=v,
+            out_list=[out_early, out_late],
+            softmax_lse_list=[lse_early, lse_late],
+            cu_seqlens_q_list=[cu_seqlens_q_early, cu_seqlens_q_late],
+            cu_seqlens_k_list=[cu_seqlens_k_early, cu_seqlens_k_late],
+            max_seqlen_q_list=[max_seqlen_q, max_seqlen_q],
+            max_seqlen_k_list=[1000, 2000],  # Group 0: first 1000, group 1: all 2000
+            softmax_scale=1.0/math.sqrt(128),
+            causal=True,
+        )
+    """
+    assert len(q_list) > 0, "Must provide at least one Q group"
+    assert len(dout_list) == len(q_list), "dout_list and q_list must have same length"
+    assert len(out_list) == len(q_list), "out_list and q_list must have same length"
+    assert len(softmax_lse_list) == len(q_list), "softmax_lse_list and q_list must have same length"
+    assert len(cu_seqlens_q_list) == len(cu_seqlens_k_list) == len(q_list), \
+        "cu_seqlens lists must match number of groups"
+    assert len(max_seqlen_q_list) == len(max_seqlen_k_list) == len(q_list), \
+        "max_seqlen lists must match number of groups"
+
+    # Validate device consistency
+    device = k.device
+    for i, (q_group, dout_group) in enumerate(zip(q_list, dout_list)):
+        assert q_group.device == device, f"q_list[{i}] must be on same device as K,V"
+        assert dout_group.device == device, f"dout_list[{i}] must be on same device as K,V"
+
+    if softmax_scale is None:
+        softmax_scale = q_list[0].shape[-1] ** (-0.5)
+
+    # Call the C++ grouped backward implementation
+    results = flash_attn_cuda.varlen_bwd_grouped(
+        dout_list,
+        q_list,
+        k,
+        v,
+        out_list,
+        softmax_lse_list,
+        cu_seqlens_q_list,
+        cu_seqlens_k_list,
+        max_seqlen_q_list,
+        max_seqlen_k_list,
+        dropout_p,
+        softmax_scale,
+        False,  # zero_tensors
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        deterministic,
+        None,  # gen
+    )
+
+    # Results format: [dq0, dq1, ..., dqN, dk, dv]
+    num_groups = len(q_list)
+    dq_list = results[:num_groups]
+    dk = results[num_groups]
+    dv = results[num_groups + 1]
+
+    return dq_list, dk, dv

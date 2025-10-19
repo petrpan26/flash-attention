@@ -2078,4 +2078,274 @@ inline __device__ void compute_attn_1rowblock_2groups_smem_share(const Params &p
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// SMEM K,V sharing kernel for N groups (3-4)
+// Generalizes the 2-group SMEM sharing approach to arbitrary number of groups
+// Each block processes one Q tile from EACH of N groups, loading K,V tiles only once
+// Provides bandwidth reduction proportional to number of groups
+template<typename Kernel_traits, int MAX_GROUPS, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+inline __device__ void compute_attn_ngroups_smem_share(const Params &params, const int bidb, const int bidh, const int* m_blocks_per_group) {
+
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+
+    extern __shared__ char smem_[];
+    const int tidx = threadIdx.x;
+
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kNWarps = Kernel_traits::kNWarps;
+
+    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+    FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
+
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+        params.rng_state[0] = std::get<0>(seed_offset);
+        params.rng_state[1] = std::get<1>(seed_offset);
+    }
+
+    const int num_groups = params.num_groups;
+    const int m_block_combined = blockIdx.x;
+
+    // Unified K,V addressing for all groups
+    const int max_seqlen_k_all_groups = params.group_max_seqlen_k[num_groups - 1];
+
+    // Get actual seqlen_k for each group
+    int actual_seqlen_k_groups[MAX_GROUPS];
+    for (int g = 0; g < num_groups; ++g) {
+        actual_seqlen_k_groups[g] = params.group_max_seqlen_k[g];
+    }
+
+    // BlockInfo for each group (all groups share same Q sequence length)
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+    const int actual_seqlen_q = binfo.actual_seqlen_q;
+
+    // Early exit check - if all groups don't need this m_block, exit
+    bool any_group_active = false;
+    for (int g = 0; g < num_groups; ++g) {
+        if (m_blocks_per_group[g] * kBlockM < actual_seqlen_q) {
+            any_group_active = true;
+            break;
+        }
+    }
+    if (!any_group_active) return;
+
+    // Compute n_block ranges for all groups and find union
+    int n_block_min_groups[MAX_GROUPS];
+    int n_block_max_groups[MAX_GROUPS];
+    int n_block_min = kBlockN * 10000;  // Large number
+    int n_block_max = 0;
+
+    for (int g = 0; g < num_groups; ++g) {
+        n_block_min_groups[g] = !Is_local ? 0 : std::max(0, (m_blocks_per_group[g] * kBlockM + actual_seqlen_k_groups[g] - actual_seqlen_q - params.window_size_left) / kBlockN);
+        n_block_max_groups[g] = cute::ceil_div(actual_seqlen_k_groups[g], kBlockN);
+
+        if (Is_causal || Is_local) {
+            n_block_max_groups[g] = std::min(n_block_max_groups[g],
+                                   cute::ceil_div((m_blocks_per_group[g] + 1) * kBlockM + actual_seqlen_k_groups[g] - actual_seqlen_q + params.window_size_right, kBlockN));
+        }
+
+        n_block_min = std::min(n_block_min, n_block_min_groups[g]);
+        n_block_max = std::max(n_block_max, n_block_max_groups[g]);
+    }
+
+    // Setup shared memory for K,V (shared by all groups)
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+                            typename Kernel_traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+                            typename Kernel_traits::SmemLayoutKV{});
+    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
+    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+
+    // Setup K,V global memory tensors (unified addressing)
+    Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
+                                          + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
+                            make_shape(max_seqlen_k_all_groups, params.h_k, params.d),
+                            make_stride(params.k_row_stride, params.k_head_stride, _1{}));
+    Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                           make_coord(_, 0));
+
+    Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
+                                          + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
+                            make_shape(max_seqlen_k_all_groups, params.h_k, params.d),
+                            make_stride(params.v_row_stride, params.v_head_stride, _1{}));
+    Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                           make_coord(_, 0));
+
+    typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
+    auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+
+    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
+    Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
+    Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+
+    typename Kernel_traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    Tensor tSrK  = thr_mma.partition_fragment_B(sK);
+    Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);
+
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
+    Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
+    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
+    Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
+    }
+
+    // Initialize accumulators for ALL groups
+    Tensor acc_o_groups[MAX_GROUPS];
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o_groups[0])> softmax_groups[MAX_GROUPS];
+
+    for (int g = 0; g < num_groups; ++g) {
+        acc_o_groups[g] = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+        clear(acc_o_groups[g]);
+        // softmax_groups[g] is default constructed
+    }
+
+    // Setup Q tensors
+    Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+
+    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+    Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
+
+    // Create masks for all groups
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> masks[MAX_GROUPS];
+    for (int g = 0; g < num_groups; ++g) {
+        float alibi_slope = 0.0f; // TODO: handle alibi if needed
+        masks[g] = FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi>(
+            actual_seqlen_k_groups[g], actual_seqlen_q,
+            params.window_size_left, params.window_size_right, alibi_slope);
+    }
+
+    // Create coordinate tensors for Q (shared for all groups since same sQ layout)
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(gmem_thr_copy_QKV.partition_D(sQ))));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tQpQ); ++k) {
+            tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d;
+        }
+    }
+
+    // OPTIMIZATION: K,V loaded ONCE per n_block, processed by ALL groups!
+    for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
+        // Load K,V once from HBM → SMEM
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                           max_seqlen_k_all_groups - n_block * kBlockN);
+        cute::cp_async_fence();
+
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV,
+                                           max_seqlen_k_all_groups - n_block * kBlockN);
+        cute::cp_async_fence();
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+
+        // Process EACH group with this K,V tile
+        for (int g = 0; g < num_groups; ++g) {
+            if (n_block < n_block_max_groups[g] && n_block >= n_block_min_groups[g] &&
+                m_blocks_per_group[g] * kBlockM < actual_seqlen_q) {
+
+                // Load Q for this group using direct pointer arithmetic
+                index_t q_offset = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
+                                        + m_blocks_per_group[g] * kBlockM * params.q_row_stride
+                                        + bidh * params.q_head_stride;
+
+                // Create fresh 2D tensor directly pointing to Q block
+                Tensor gQ = make_tensor(
+                    make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + q_offset),
+                    Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                    make_stride(params.q_row_stride, _1{})
+                );
+
+                // Partition and load
+                Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
+                FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+                                                   actual_seqlen_q - m_blocks_per_group[g] * kBlockM);
+                cute::cp_async_fence();
+                FLASH_NAMESPACE::cp_async_wait<0>();
+                __syncthreads();
+
+                // Copy Q to registers
+                Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+                cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+
+                // Compute Q@K^T
+                Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+                clear(acc_s);
+                FLASH_NAMESPACE::gemm<false>(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+
+                // Apply mask
+                masks[g].template apply_mask<Is_causal, Is_even_MN>(
+                    acc_s, n_block * kBlockN, m_blocks_per_group[g] * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+                );
+
+                // Softmax and rescale output
+                bool is_first_tile = (n_block == n_block_max_groups[g] - 1);
+                if (is_first_tile) {
+                    softmax_groups[g].template softmax_rescale_o<true, false>(acc_s, acc_o_groups[g], params.scale_softmax_log2);
+                } else {
+                    softmax_groups[g].template softmax_rescale_o<false, false>(acc_s, acc_o_groups[g], params.scale_softmax_log2);
+                }
+
+                // Compute scores@V
+                Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+                Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+                FLASH_NAMESPACE::gemm_rs(acc_o_groups[g], tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+                __syncthreads();  // Ensure this group is done before next group overwrites Q in SMEM
+            }
+        }
+    }
+
+    // ============ Write outputs for all groups ============
+    for (int g = 0; g < num_groups; ++g) {
+        if (m_blocks_per_group[g] * kBlockM < actual_seqlen_q) {
+            Tensor lse = softmax_groups[g].template normalize_softmax_lse<false>(acc_o_groups[g], params.scale_softmax, 1.0f);
+            Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o_groups[g]);
+
+            Element* o_ptr = reinterpret_cast<Element*>(params.group_o_ptrs[g]);
+            Tensor mO = make_tensor(make_gmem_ptr(o_ptr + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                                           make_shape(binfo.actual_seqlen_q, params.h, params.d),
+                                           make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+            Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                          make_coord(m_blocks_per_group[g], 0));
+
+            typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+            Tensor tOrO = make_fragment_like(tOgO);
+            cute::copy(rO, tOrO);
+
+            Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+            Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+            if (!Is_even_K) {
+                #pragma unroll
+                for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+            }
+
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, false, false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
+                                                         actual_seqlen_q - m_blocks_per_group[g] * kBlockM);
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 } // namespace FLASH_NAMESPACE
