@@ -354,7 +354,7 @@ void run_flash_fwd_grouped(Flash_fwd_params &params, cudaStream_t stream, int to
 
 // OPTIMIZATION: Cache-aware grouped flash attention kernel
 // Uses round-robin block scheduling to maximize L2 cache hit rate for K,V sharing
-DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_grouped_cache_aware_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, int max_m_blocks_per_group) {
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_grouped_cache_aware_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
         static_assert(!(Is_causal && Is_local)); // Enforce constraints
 
@@ -388,10 +388,64 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_grouped_cache_aware_kernel, bool Is_dropou
     #endif
 }
 
+// SMEM K,V sharing kernel launcher for exactly 2 groups
+// Loads K,V once per tile and processes both groups sequentially within the same block
+// Provides ~50% bandwidth reduction for K,V loads compared to separate calls
+DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_2groups_smem_share_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
+    #if defined(ARCH_SUPPORTS_FLASH)
+        const int m_block_combined = blockIdx.x;
+        const int bidb = blockIdx.y;
+        const int bidh = blockIdx.z;
+
+        // Each block processes one Q tile from group 0 AND one Q tile from group 1
+        // We use the same m_block index for both groups (they process corresponding Q positions)
+        const int m_block_group0 = m_block_combined;
+        const int m_block_group1 = m_block_combined;
+
+        FLASH_NAMESPACE::compute_attn_1rowblock_2groups_smem_share<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
+            params, bidb, bidh, m_block_group0, m_block_group1
+        );
+    #else
+        FLASH_UNSUPPORTED_ARCH
+    #endif
+}
+
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
+void run_flash_fwd_2groups_smem_share(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m) {
+    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+
+    // Grid: Each block processes one Q tile from EACH group
+    // So we only need grid_size_m blocks (not grid_size_m * num_groups)
+    dim3 grid(grid_size_m, params.b, params.h);
+
+    const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+    const bool return_softmax = params.p_ptr != nullptr;
+
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+            auto kernel = &flash_fwd_2groups_smem_share_kernel<Kernel_traits, Is_dropout, Is_causal,
+                                           false, // Is_local
+                                           false, // Has_alibi
+                                           false, // IsEvenMN
+                                           IsEvenKConst,
+                                           false, // Is_softcap
+                                           ReturnSoftmaxConst && Is_dropout>;
+
+            if (smem_size >= 48 * 1024) {
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            }
+
+            kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        });
+    });
+}
+
 // Cache-aware grouped flash attention launcher
 // Uses round-robin grid layout to ensure K,V tiles are reused across groups via L2 cache
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
-void run_flash_fwd_grouped_cache_aware(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m, int max_m_blocks_per_group) {
+void run_flash_fwd_grouped_cache_aware(Flash_fwd_params &params, cudaStream_t stream, int grid_size_m) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
 
     // Grid uses round-robin layout: (max_m_blocks_per_group * num_groups, batch, heads)
@@ -410,8 +464,7 @@ void run_flash_fwd_grouped_cache_aware(Flash_fwd_params &params, cudaStream_t st
                                            false, // IsEvenMN - disabled for simplicity
                                            IsEvenKConst,
                                            false, // Is_softcap
-                                           ReturnSoftmaxConst && Is_dropout,
-                                           max_m_blocks_per_group>;
+                                           ReturnSoftmaxConst && Is_dropout>;
 
             if (smem_size >= 48 * 1024) {
                 C10_CUDA_CHECK(cudaFuncSetAttribute(
@@ -445,8 +498,7 @@ void run_flash_fwd_grouped_sequential(Flash_fwd_params &params, cudaStream_t str
                                            false, // IsEvenMN
                                            IsEvenKConst,
                                            false, // Is_softcap
-                                           ReturnSoftmaxConst && Is_dropout,
-                                           1>;  // max_m_blocks_per_group=1 since we're sequential
+                                           ReturnSoftmaxConst && Is_dropout>;
 
             if (smem_size >= 48 * 1024) {
                 C10_CUDA_CHECK(cudaFuncSetAttribute(

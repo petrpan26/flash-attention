@@ -1331,8 +1331,14 @@ inline __device__ void compute_attn_1rowblock_grouped(const Params &params, cons
     // Get group-specific K,V sequence length (for loop bounds only)
     const int actual_seqlen_k = params.group_max_seqlen_k[group_id];
 
-    // Use standard BlockInfo for Q
-    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+    // Create group-specific params for BlockInfo
+    // We need to temporarily override cu_seqlens_q and cu_seqlens_k to point to this group's values
+    Params params_group = params;
+    params_group.cu_seqlens_q = params.group_cu_seqlens_q[group_id];
+    params_group.cu_seqlens_k = params.group_cu_seqlens_k[group_id];
+
+    // Use group-specific BlockInfo for Q and K offsets
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params_group, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
@@ -1344,7 +1350,8 @@ inline __device__ void compute_attn_1rowblock_grouped(const Params &params, cons
 
     // Early exit if no work
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
-        // Get group-specific output pointer
+        // Get group-specific pointers
+        Element* q_ptr = reinterpret_cast<Element*>(params.group_q_ptrs[group_id]);
         Element* o_ptr = reinterpret_cast<Element*>(params.group_o_ptrs[group_id]);
         Tensor mO = make_tensor(make_gmem_ptr(o_ptr + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
                                 make_shape(binfo.actual_seqlen_q, params.h, params.d),
@@ -1386,8 +1393,10 @@ inline __device__ void compute_attn_1rowblock_grouped(const Params &params, cons
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
-    // Load Q (same for all groups)
-    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
+    // Load Q (group-specific)
+    Element* q_ptr = reinterpret_cast<Element*>(params.group_q_ptrs[group_id]);
+    int* cu_seqlens_q_ptr = params.group_cu_seqlens_q[group_id];
+    Tensor mQ = make_tensor(make_gmem_ptr(q_ptr
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
@@ -1712,6 +1721,359 @@ inline __device__ void compute_attn_grouped(const Params &params) {
     FLASH_NAMESPACE::compute_attn_1rowblock_grouped<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(
         params, bidb, bidh, m_block_local, group_id
     );
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// SMEM K,V sharing kernel for exactly 2 groups
+// Loads K,V once per tile and processes both groups sequentially
+// Guarantees 50% bandwidth reduction for K,V loads
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+inline __device__ void compute_attn_1rowblock_2groups_smem_share(const Params &params, const int bidb, const int bidh, const int m_block_group0, const int m_block_group1) {
+
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+
+    extern __shared__ char smem_[];
+    const int tidx = threadIdx.x;
+
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kNWarps = Kernel_traits::kNWarps;
+
+    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+    FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
+                           bidb, bidh, tidx, params.h);
+
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+        params.rng_state[0] = std::get<0>(seed_offset);
+        params.rng_state[1] = std::get<1>(seed_offset);
+    }
+
+    // Unified K,V addressing for both groups
+    const int max_seqlen_k_all_groups = params.group_max_seqlen_k[params.num_groups - 1];
+
+    // Group-specific seqlens (read from params for grouped attention)
+    // Note: All groups share the same Q sequence length in this implementation
+    const int actual_seqlen_k_group0 = params.group_max_seqlen_k[0];
+    const int actual_seqlen_k_group1 = params.group_max_seqlen_k[1];
+
+    // BlockInfo for Q, K,V offset calculations
+    // Note: Both groups share the same Q sequence length, so both binfo objects return the same actual_seqlen_q
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo_group0(params, bidb);
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo_group1(params, bidb);
+    const int actual_seqlen_q = binfo_group0.actual_seqlen_q;  // Same for both groups
+
+    // Early exit checks
+    if (m_block_group0 * kBlockM >= actual_seqlen_q &&
+        m_block_group1 * kBlockM >= actual_seqlen_q) return;
+
+    // Compute n_block ranges for both groups
+    const int n_block_min_group0 = !Is_local ? 0 : std::max(0, (m_block_group0 * kBlockM + actual_seqlen_k_group0 - actual_seqlen_q - params.window_size_left) / kBlockN);
+    int n_block_max_group0 = cute::ceil_div(actual_seqlen_k_group0, kBlockN);
+    if (Is_causal || Is_local) {
+        n_block_max_group0 = std::min(n_block_max_group0,
+                               cute::ceil_div((m_block_group0 + 1) * kBlockM + actual_seqlen_k_group0 - actual_seqlen_q + params.window_size_right, kBlockN));
+    }
+
+    const int n_block_min_group1 = !Is_local ? 0 : std::max(0, (m_block_group1 * kBlockM + actual_seqlen_k_group1 - actual_seqlen_q - params.window_size_left) / kBlockN);
+    int n_block_max_group1 = cute::ceil_div(actual_seqlen_k_group1, kBlockN);
+    if (Is_causal || Is_local) {
+        n_block_max_group1 = std::min(n_block_max_group1,
+                               cute::ceil_div((m_block_group1 + 1) * kBlockM + actual_seqlen_k_group1 - actual_seqlen_q + params.window_size_right, kBlockN));
+    }
+
+    // Use the max range to cover both groups
+    const int n_block_min = std::min(n_block_min_group0, n_block_min_group1);
+    const int n_block_max = std::max(n_block_max_group0, n_block_max_group1);
+
+    // Setup shared memory for K,V (shared by both groups)
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+                            typename Kernel_traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+                            typename Kernel_traits::SmemLayoutKV{});
+    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
+    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+
+    // Setup K,V global memory tensors (unified addressing)
+    Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
+                                          + binfo_group0.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
+                            make_shape(max_seqlen_k_all_groups, params.h_k, params.d),
+                            make_stride(params.k_row_stride, params.k_head_stride, _1{}));
+    Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                           make_coord(_, 0));
+
+    Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
+                                          + binfo_group0.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
+                            make_shape(max_seqlen_k_all_groups, params.h_k, params.d),
+                            make_stride(params.v_row_stride, params.v_head_stride, _1{}));
+    Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                           make_coord(_, 0));
+
+    typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
+    auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+
+    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
+    Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
+    Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+
+    typename Kernel_traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    Tensor tSrK  = thr_mma.partition_fragment_B(sK);
+    Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);
+
+    auto smem_tiled_copy_K = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
+    Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
+    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
+    Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d; }
+    }
+
+    // Initialize accumulators for BOTH groups
+    Tensor acc_o_group0 = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    Tensor acc_o_group1 = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    clear(acc_o_group0);
+    clear(acc_o_group1);
+
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o_group0)> softmax_group0;
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o_group1)> softmax_group1;
+
+    // Setup Q tensors - we'll update the pointer for each group
+    Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+
+    auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+    Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
+
+    const float alibi_slope_group0 = 0.0f; // TODO: handle alibi if needed
+    const float alibi_slope_group1 = 0.0f;
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask_group0(actual_seqlen_k_group0, actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope_group0);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask_group1(actual_seqlen_k_group1, actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope_group1);
+
+    // FIX: Create shared Q base tensor (will be tiled per-group in the loop)
+    Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
+                                          + binfo_group0.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+                            make_shape(binfo_group0.actual_seqlen_q, params.h, params.d),
+                            make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+
+    // Create coordinate tensors for Q (shared for both groups since same sQ layout)
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(gmem_thr_copy_QKV.partition_D(sQ))));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tQpQ); ++k) {
+            tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d;
+        }
+    }
+
+    // OPTIMIZATION: K,V loaded ONCE per n_block, processed by both groups!
+    for (int n_block = n_block_max - 1; n_block >= n_block_min; --n_block) {
+        // Load K,V once from HBM → SMEM
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+                                           max_seqlen_k_all_groups - n_block * kBlockN);
+        cute::cp_async_fence();
+
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV,
+                                           max_seqlen_k_all_groups - n_block * kBlockN);
+        cute::cp_async_fence();
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+
+        // ============ Process Group 0 with this K,V tile ============
+        if (n_block < n_block_max_group0 && n_block >= n_block_min_group0 &&
+            m_block_group0 * kBlockM < binfo_group0.actual_seqlen_q) {
+
+            // SOLUTION 1: Use direct pointer arithmetic to avoid CuTe zero-stride layouts
+            // Calculate exact memory address for group 0's Q block
+            index_t q_offset_group0 = binfo_group0.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
+                                    + m_block_group0 * kBlockM * params.q_row_stride
+                                    + bidh * params.q_head_stride;
+
+            // Create fresh 2D tensor directly pointing to Q block (no parent tensor context)
+            Tensor gQ_group0 = make_tensor(
+                make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + q_offset_group0),
+                Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                make_stride(params.q_row_stride, _1{})
+            );
+
+            // Partition and load (should work without zero-stride issues)
+            Tensor tQgQ_group0 = gmem_thr_copy_QKV.partition_S(gQ_group0);
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ_group0, tQsQ, tQcQ, tQpQ,
+                                               actual_seqlen_q - m_block_group0 * kBlockM);
+            cute::cp_async_fence();
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+
+            // Copy Q to registers
+            Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+            cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+
+            // Compute Q@K^T
+            Tensor acc_s_group0 = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+            clear(acc_s_group0);
+            FLASH_NAMESPACE::gemm<false>(acc_s_group0, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+
+            // Apply mask
+            mask_group0.template apply_mask<Is_causal, Is_even_MN>(
+                acc_s_group0, n_block * kBlockN, m_block_group0 * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            );
+
+            // Softmax and rescale output
+            bool is_first_tile = (n_block == n_block_max_group0 - 1);
+            if (is_first_tile) {
+                softmax_group0.template softmax_rescale_o<true, false>(acc_s_group0, acc_o_group0, params.scale_softmax_log2);
+            } else {
+                softmax_group0.template softmax_rescale_o<false, false>(acc_s_group0, acc_o_group0, params.scale_softmax_log2);
+            }
+
+            // Compute scores@V
+            Tensor rP_group0 = FLASH_NAMESPACE::convert_type<Element>(acc_s_group0);
+            Tensor tOrP_group0 = make_tensor(rP_group0.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP_group0.layout()));
+            FLASH_NAMESPACE::gemm_rs(acc_o_group0, tOrP_group0, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
+
+        __syncthreads();  // Ensure group 0 is done before group 1 overwrites Q in SMEM
+
+        // ============ Process Group 1 with same K,V tile (SMEM REUSE!) ============
+        if (n_block < n_block_max_group1 && n_block >= n_block_min_group1 &&
+            m_block_group1 * kBlockM < binfo_group1.actual_seqlen_q) {
+
+            // SOLUTION 1: Load Q for group 1 using direct pointer arithmetic
+            // Calculate exact memory address for group 1's Q block
+            index_t q_offset_group1 = binfo_group1.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
+                                    + m_block_group1 * kBlockM * params.q_row_stride
+                                    + bidh * params.q_head_stride;
+
+            // Create fresh 2D tensor directly pointing to Q block
+            Tensor gQ_group1 = make_tensor(
+                make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + q_offset_group1),
+                Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                make_stride(params.q_row_stride, _1{})
+            );
+
+            // Partition and load
+            Tensor tQgQ_group1 = gmem_thr_copy_QKV.partition_S(gQ_group1);
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ_group1, tQsQ, tQcQ, tQpQ,
+                                               binfo_group1.actual_seqlen_q - m_block_group1 * kBlockM);
+            cute::cp_async_fence();
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+
+            // Copy Q to registers
+            Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+            cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+
+            // Compute Q@K^T
+            Tensor acc_s_group1 = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+            clear(acc_s_group1);
+            FLASH_NAMESPACE::gemm<false>(acc_s_group1, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+
+            // Apply mask
+            mask_group1.template apply_mask<Is_causal, Is_even_MN>(
+                acc_s_group1, n_block * kBlockN, m_block_group1 * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            );
+
+            // Softmax and rescale output
+            bool is_first_tile = (n_block == n_block_max_group1 - 1);
+            if (is_first_tile) {
+                softmax_group1.template softmax_rescale_o<true, false>(acc_s_group1, acc_o_group1, params.scale_softmax_log2);
+            } else {
+                softmax_group1.template softmax_rescale_o<false, false>(acc_s_group1, acc_o_group1, params.scale_softmax_log2);
+            }
+
+            // Compute scores@V
+            Tensor rP_group1 = FLASH_NAMESPACE::convert_type<Element>(acc_s_group1);
+            Tensor tOrP_group1 = make_tensor(rP_group1.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP_group1.layout()));
+            FLASH_NAMESPACE::gemm_rs(acc_o_group1, tOrP_group1, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
+
+        __syncthreads();  // Ensure both groups are done before loading next K,V
+    }
+
+    // ============ Write outputs for both groups ============
+    // Group 0 output
+    if (m_block_group0 * kBlockM < binfo_group0.actual_seqlen_q) {
+        Tensor lse_group0 = softmax_group0.template normalize_softmax_lse<false>(acc_o_group0, params.scale_softmax, 1.0f);
+        Tensor rO_group0 = FLASH_NAMESPACE::convert_type<Element>(acc_o_group0);
+
+        Element* o_ptr_group0 = reinterpret_cast<Element*>(params.group_o_ptrs[0]);
+        Tensor mO_group0 = make_tensor(make_gmem_ptr(o_ptr_group0 + binfo_group0.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                                       make_shape(binfo_group0.actual_seqlen_q, params.h, params.d),
+                                       make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+        Tensor gO_group0 = local_tile(mO_group0(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                      make_coord(m_block_group0, 0));
+
+        typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+        Tensor tOgO_group0 = gmem_thr_copy_O.partition_D(gO_group0);
+        Tensor tOrO_group0 = make_fragment_like(tOgO_group0);
+        cute::copy(rO_group0, tOrO_group0);
+
+        Tensor cO_group0 = make_identity_tensor(make_shape(size<0>(gO_group0), size<1>(gO_group0)));
+        Tensor tOcO_group0 = gmem_thr_copy_O.partition_D(cO_group0);
+        Tensor tOpO_group0 = make_tensor<bool>(make_shape(size<2>(tOgO_group0)));
+        if (!Is_even_K) {
+            #pragma unroll
+            for (int k = 0; k < size(tOpO_group0); ++k) { tOpO_group0(k) = get<1>(tOcO_group0(0, 0, k)) < params.d; }
+        }
+
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, false, false>(gmem_tiled_copy_O, tOrO_group0, tOgO_group0, tOcO_group0, tOpO_group0,
+                                                     binfo_group0.actual_seqlen_q - m_block_group0 * kBlockM);
+
+        // Write LSE
+        ElementAccum* lse_ptr_group0 = reinterpret_cast<ElementAccum*>(params.group_softmax_lse_ptrs[0]);
+        // TODO: Write LSE to global memory
+    }
+
+    // Group 1 output
+    if (m_block_group1 * kBlockM < binfo_group1.actual_seqlen_q) {
+        Tensor lse_group1 = softmax_group1.template normalize_softmax_lse<false>(acc_o_group1, params.scale_softmax, 1.0f);
+        Tensor rO_group1 = FLASH_NAMESPACE::convert_type<Element>(acc_o_group1);
+
+        Element* o_ptr_group1 = reinterpret_cast<Element*>(params.group_o_ptrs[1]);
+        Tensor mO_group1 = make_tensor(make_gmem_ptr(o_ptr_group1 + binfo_group1.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+                                       make_shape(binfo_group1.actual_seqlen_q, params.h, params.d),
+                                       make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+        Tensor gO_group1 = local_tile(mO_group1(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                      make_coord(m_block_group1, 0));
+
+        typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+        Tensor tOgO_group1 = gmem_thr_copy_O.partition_D(gO_group1);
+        Tensor tOrO_group1 = make_fragment_like(tOgO_group1);
+        cute::copy(rO_group1, tOrO_group1);
+
+        Tensor cO_group1 = make_identity_tensor(make_shape(size<0>(gO_group1), size<1>(gO_group1)));
+        Tensor tOcO_group1 = gmem_thr_copy_O.partition_D(cO_group1);
+        Tensor tOpO_group1 = make_tensor<bool>(make_shape(size<2>(tOgO_group1)));
+        if (!Is_even_K) {
+            #pragma unroll
+            for (int k = 0; k < size(tOpO_group1); ++k) { tOpO_group1(k) = get<1>(tOcO_group1(0, 0, k)) < params.d; }
+        }
+
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, false, false>(gmem_tiled_copy_O, tOrO_group1, tOgO_group1, tOcO_group1, tOpO_group1,
+                                                     binfo_group1.actual_seqlen_q - m_block_group1 * kBlockM);
+
+        // Write LSE
+        ElementAccum* lse_ptr_group1 = reinterpret_cast<ElementAccum*>(params.group_softmax_lse_ptrs[1]);
+        // TODO: Write LSE to global memory
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
