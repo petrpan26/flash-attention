@@ -925,56 +925,232 @@ void run_mha_fwd_multigroup(Flash_fwd_multigroup_params &params, cudaStream_t st
 template<typename T, int NumGroups, bool Is_causal>
 void run_mha_fwd_multigroup_hdim64(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    // For NumGroups=2: kBlockM=64, kBlockN=128
-    // Shared memory: 2 * 64 * 64 * 2 + 2 * 128 * 64 * 2 = 16KB + 32KB = 48KB ✓
-    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
-    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    // Optimized configs based on NumGroups
+    if constexpr (NumGroups == 1) {
+        // Single group: use standard FA config
+        // Shared memory: 1*128*64*2 + 2*128*64*2 = 16KB + 32KB = 48KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 128, 4, 1, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 2) {
+        // 2 groups: balanced config
+        // Shared memory: 2*96*64*2 + 2*128*64*2 = 24KB + 32KB = 56KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 128, 4, 2, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 3) {
+        // 3 groups: reduce M to fit memory
+        // Shared memory: 3*64*64*2 + 2*128*64*2 = 24KB + 32KB = 56KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, 3, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else {
+        // 4+ groups: smaller tiles
+        // Shared memory: 4*64*64*2 + 2*128*64*2 = 32KB + 32KB = 64KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, int NumGroups, bool Is_causal>
 void run_mha_fwd_multigroup_hdim128(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
-    // For NumGroups=2: kBlockM=64, kBlockN=128
-    // Shared memory: 2 * 64 * 128 * 2 + 2 * 128 * 128 * 2 = 32KB + 64KB = 96KB ✓
-    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
-    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;  // A6000, A100 8.6/8.9
+
+    if constexpr (NumGroups == 1) {
+        // Single group: use standard FA optimizations
+        if (is_sm8x) {
+            if constexpr (!Is_causal) {
+                // Non-causal on sm8x: use 2 CTAs/SM config (48KB smem)
+                // Shared memory: 1*128*128*2 + 2*32*128*2 = 32KB + 16KB = 48KB ✓
+                using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 32, 4, 1, false, false, T>;
+                run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+            } else {
+                // Causal: square tiles for better reuse
+                // Shared memory: 1*64*128*2 + 2*64*128*2 = 16KB + 32KB = 48KB ✓
+                using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 1, false, false, T>;
+                run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+            }
+        } else {
+            // Other architectures: balanced config
+            // Shared memory: 1*128*128*2 + 2*64*128*2 = 32KB + 32KB = 64KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 64, 4, 1, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        }
+    } else if constexpr (NumGroups == 2) {
+        // 2 groups: optimize based on architecture
+        if (is_sm8x && !Is_causal) {
+            // Try to get 2 CTAs/SM with smaller N
+            // Shared memory: 2*96*128*2 + 2*48*128*2 = 48KB + 24KB = 72KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 48, 4, 2, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        } else if (Is_causal) {
+            // Causal: square tiles
+            // Shared memory: 2*64*128*2 + 2*64*128*2 = 32KB + 32KB = 64KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 2, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        } else {
+            // Balanced config
+            // Shared memory: 2*96*128*2 + 2*64*128*2 = 48KB + 32KB = 80KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 64, 4, 2, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        }
+    } else if constexpr (NumGroups == 3) {
+        // 3 groups: smaller tiles
+        // Shared memory: 3*64*128*2 + 2*64*128*2 = 48KB + 32KB = 80KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 3, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else {
+        // 4+ groups: conservative config
+        // Shared memory: 4*64*128*2 + 2*64*128*2 = 64KB + 32KB = 96KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, NumGroups, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, int NumGroups, bool Is_causal>
 void run_mha_fwd_multigroup_hdim32(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
-    // For NumGroups=2: kBlockM=64, kBlockN=128
-    // Shared memory: 2 * 64 * 32 * 2 + 2 * 128 * 32 * 2 = 8KB + 16KB = 24KB ✓
-    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
-    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    // Optimized configs - d=32 is small, can use larger tiles
+    if constexpr (NumGroups == 1) {
+        // Single group: standard FA config with large tiles
+        // Shared memory: 1*128*32*2 + 2*128*32*2 = 8KB + 16KB = 24KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 128, 4, 1, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 2) {
+        // 2 groups: can still use large M
+        // Shared memory: 2*128*32*2 + 2*128*32*2 = 16KB + 16KB = 32KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 128, 4, 2, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 3) {
+        // 3 groups: balanced
+        // Shared memory: 3*96*32*2 + 2*128*32*2 = 18KB + 16KB = 34KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 128, 4, 3, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else {
+        // 4+ groups
+        // Shared memory: 4*96*32*2 + 2*128*32*2 = 24KB + 16KB = 40KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 128, 4, NumGroups, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, int NumGroups, bool Is_causal>
 void run_mha_fwd_multigroup_hdim96(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
-    // For NumGroups=2: kBlockM=64, kBlockN=128
-    // Shared memory: 2 * 64 * 96 * 2 + 2 * 128 * 96 * 2 = 24KB + 48KB = 72KB ✓
-    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
-    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+
+    if constexpr (NumGroups == 1) {
+        // Single group: use standard FA config
+        if (is_sm8x) {
+            if constexpr (!Is_causal) {
+                // Non-causal on sm8x
+                // Shared memory: 1*128*96*2 + 2*64*96*2 = 24KB + 24KB = 48KB ✓
+                using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 64, 4, 1, false, false, T>;
+                run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+            } else {
+                // Causal: square tiles
+                // Shared memory: 1*64*96*2 + 2*64*96*2 = 12KB + 24KB = 36KB ✓
+                using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 1, false, false, T>;
+                run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+            }
+        } else {
+            // Shared memory: 1*128*96*2 + 2*64*96*2 = 24KB + 24KB = 48KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 64, 4, 1, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        }
+    } else if constexpr (NumGroups == 2) {
+        // 2 groups: balanced config
+        if (Is_causal) {
+            // Causal: square tiles
+            // Shared memory: 2*64*96*2 + 2*64*96*2 = 24KB + 24KB = 48KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 2, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        } else {
+            // Non-causal: optimize for throughput
+            // Shared memory: 2*96*96*2 + 2*64*96*2 = 36KB + 24KB = 60KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 64, 4, 2, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        }
+    } else if constexpr (NumGroups == 3) {
+        // 3 groups
+        // Shared memory: 3*64*96*2 + 2*64*96*2 = 36KB + 24KB = 60KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 3, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else {
+        // 4+ groups
+        // Shared memory: 4*64*96*2 + 2*64*96*2 = 48KB + 24KB = 72KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, NumGroups, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, int NumGroups, bool Is_causal>
 void run_mha_fwd_multigroup_hdim192(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
-    // For NumGroups=2: kBlockM=64, kBlockN=128
-    // Shared memory: 2 * 64 * 192 * 2 + 2 * 128 * 192 * 2 = 48KB + 96KB = 144KB ✓
-    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
-    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+
+    if constexpr (NumGroups == 1) {
+        // Single group: use 8 warps like standard FA for higher throughput
+        // Shared memory: 1*128*192*2 + 2*64*192*2 = 48KB + 48KB = 96KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 64, 8, 1, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 2) {
+        // 2 groups: use 8 warps for better throughput
+        // Shared memory: 2*96*192*2 + 2*64*192*2 = 72KB + 48KB = 120KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 96, 64, 8, 2, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 3) {
+        // 3 groups: smaller config with 8 warps
+        // Shared memory: 3*64*192*2 + 2*64*192*2 = 72KB + 48KB = 120KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 8, 3, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else {
+        // 4+ groups: use 4 warps to fit memory
+        // Shared memory: 4*64*192*2 + 2*64*192*2 = 96KB + 48KB = 144KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, NumGroups, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, int NumGroups, bool Is_causal>
 void run_mha_fwd_multigroup_hdim256(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256;
-    // For NumGroups=2: kBlockM=64, kBlockN=128
-    // Shared memory: 2 * 64 * 256 * 2 + 2 * 128 * 256 * 2 = 64KB + 128KB = 192KB ✗ (exceeds A100 limit)
-    // Reduce kBlockM to 32 for d=256
-    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 32, 128, 4, NumGroups, false, false, T>;
-    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_sm, max_smem_per_block;
+    cudaDeviceGetAttribute(&max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+
+    if constexpr (NumGroups == 1) {
+        // Single group: use 8 warps like standard FA
+        // Check if we can use large tiles (A100 style) or need smaller (H100 style)
+        if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) &&
+            max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+            // A100: large tiles with 8 warps
+            // Shared memory: 1*128*256*2 + 2*64*256*2 = 64KB + 64KB = 128KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 128, 64, 8, 1, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        } else {
+            // H100: prioritize 2 CTAs/SM
+            // Shared memory: 1*64*256*2 + 2*64*256*2 = 32KB + 64KB = 96KB ✓
+            using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 1, false, false, T>;
+            run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+        }
+    } else if constexpr (NumGroups == 2) {
+        // 2 groups: use 8 warps if possible
+        // Shared memory: 2*64*256*2 + 2*64*256*2 = 64KB + 64KB = 128KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 8, 2, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else if constexpr (NumGroups == 3) {
+        // 3 groups: smaller tiles, 4 warps
+        // Shared memory: 3*64*256*2 + 2*64*256*2 = 96KB + 64KB = 160KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 64, 4, 3, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    } else {
+        // 4+ groups: very small tiles
+        // Shared memory: 4*48*256*2 + 2*64*256*2 = 96KB + 64KB = 160KB ✓
+        using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 48, 64, 4, NumGroups, false, false, T>;
+        run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
