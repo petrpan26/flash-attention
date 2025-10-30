@@ -206,15 +206,18 @@ __device__ __forceinline__ void write_gradients_separate(
     int num_elements,              // Number of elements
     index_t buffer_stride          // Stride between groups
 ) {
-    // TODO Phase 3: Write to separate buffer for later reduction
+    // Write to separate per-group buffer for later reduction
     // accum_buffer layout: [num_groups, K_size, num_heads_k, head_dim]
     // Each group writes to its own slice
 
-    // Example pseudocode:
-    // for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
-    //     int offset = group_id * buffer_stride + i;
-    //     accum_buffer[offset] = local_grad[i];
-    // }
+    // Calculate base offset for this group's slice
+    const index_t group_offset = group_id * buffer_stride;
+
+    // Each thread writes its portion of gradients
+    #pragma unroll 4
+    for (int i = threadIdx.x; i < num_elements; i += blockDim.x) {
+        accum_buffer[group_offset + i] = local_grad[i];
+    }
 }
 
 // Reduction kernel (separate launch)
@@ -227,19 +230,30 @@ __global__ void reduce_multigroup_gradients_kernel(
     int num_heads_k,
     int head_dim
 ) {
-    // TODO Phase 3: Reduce across groups
+    // Reduce across groups deterministically
     // Each thread handles one output element
     // output_grad[idx] = sum_g accum_buffer[g][idx]
 
-    // Example pseudocode:
-    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // if (idx < K_size * num_heads_k * head_dim) {
-    //     float sum = 0.0f;
-    //     for (int g = 0; g < num_groups; g++) {
-    //         sum += static_cast<float>(accum_buffer[g * K_size * ... + idx]);
-    //     }
-    //     output_grad[idx] = static_cast<Element>(sum);
-    // }
+    const int total_elements = K_size * num_heads_k * head_dim;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_elements) {
+        // Use FP32 accumulation for better precision
+        float sum = 0.0f;
+
+        // Sum contributions from all groups
+        // Buffer layout: [num_groups, K_size, num_heads_k, head_dim]
+        const index_t group_stride = K_size * num_heads_k * head_dim;
+
+        #pragma unroll
+        for (int g = 0; g < num_groups; g++) {
+            const index_t offset = g * group_stride + idx;
+            sum += static_cast<float>(accum_buffer[offset]);
+        }
+
+        // Write final result
+        output_grad[idx] = static_cast<Element>(sum);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -690,26 +704,56 @@ __device__ __forceinline__ void compute_dqkv_multigroup_1colblock(
             }
         }
     } else {
-        // Deterministic mode: write to separate per-group buffers, then reduce
-        // TODO Phase 3 Enhancement: Implement two-pass reduction
-        // For now, fall back to atomic mode with a warning
-        // In production, this would write to params.dk_accum_ptr and params.dv_accum_ptr
-        // Then a separate reduction kernel would sum across groups
+        // Deterministic mode: write to separate per-threadblock buffers, then reduce
+        // Each threadblock processes a unique (n_block, batch, head) combination,
+        // so we write to a unique slice of the accumulation buffer
 
-        // Fallback: use atomics anyway (better than incorrect results)
-        Tensor cdKV = make_identity_tensor(make_shape(size<0>(sdK), size<1>(sdK)));
-        Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
+        // Calculate unique threadblock ID
+        const int tb_id = blockIdx.x + blockIdx.y * gridDim.x + blockIdx.z * gridDim.x * gridDim.y;
+        const int elements_per_block = kBlockN * kHeadDim;
 
-        #pragma unroll
-        for (int i = 0; i < size(tdKgdK); ++i) {
-            if (get<0>(tdKVcdKV(_0{}, i, _0{})) < actual_seqlen_k - n_block * kBlockN) {
-                atomicAdd(reinterpret_cast<float*>(&tdKgdK(i)), static_cast<float>(tdKsdK(i)));
+        // Use params.dk_accum_ptr and params.dv_accum_ptr if available
+        if (params.dk_accum_ptr != nullptr && params.dv_accum_ptr != nullptr) {
+            // Write to accumulation buffers (no atomics needed, unique location per TB)
+            const index_t accum_offset = tb_id * elements_per_block;
+
+            Element* dk_accum = reinterpret_cast<Element*>(params.dk_accum_ptr) + accum_offset;
+            Element* dv_accum = reinterpret_cast<Element*>(params.dv_accum_ptr) + accum_offset;
+
+            // Create tensors pointing to accumulation buffers
+            Tensor gdK_accum = make_tensor(make_gmem_ptr(dk_accum),
+                                          Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                          make_stride(params.dk_row_stride, _1{}));
+            Tensor gdV_accum = make_tensor(make_gmem_ptr(dv_accum),
+                                          Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                          make_stride(params.dv_row_stride, _1{}));
+
+            Tensor tdKgdK_accum = gmem_thr_copy_dKV.partition_D(gdK_accum);
+            Tensor tdVgdV_accum = gmem_thr_copy_dKV.partition_D(gdV_accum);
+
+            // Write without atomics (each TB has unique location)
+            Tensor cdKV = make_identity_tensor(make_shape(size<0>(sdK), size<1>(sdK)));
+            Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
+
+            cute::copy(gmem_tiled_copy_dKV, tdKsdK, tdKgdK_accum);
+            cute::copy(gmem_tiled_copy_dKV, tdVsdV, tdVgdV_accum);
+        } else {
+            // Fallback: use atomics if accumulation buffers not provided
+            // This maintains correctness but loses determinism
+            Tensor cdKV = make_identity_tensor(make_shape(size<0>(sdK), size<1>(sdK)));
+            Tensor tdKVcdKV = gmem_thr_copy_dKV.partition_D(cdKV);
+
+            #pragma unroll
+            for (int i = 0; i < size(tdKgdK); ++i) {
+                if (get<0>(tdKVcdKV(_0{}, i, _0{})) < actual_seqlen_k - n_block * kBlockN) {
+                    atomicAdd(reinterpret_cast<float*>(&tdKgdK(i)), static_cast<float>(tdKsdK(i)));
+                }
             }
-        }
-        #pragma unroll
-        for (int i = 0; i < size(tdVgdV); ++i) {
-            if (get<0>(tdKVcdKV(_0{}, i, _0{})) < actual_seqlen_k - n_block * kBlockN) {
-                atomicAdd(reinterpret_cast<float*>(&tdVgdV(i)), static_cast<float>(tdVsdV(i)));
+            #pragma unroll
+            for (int i = 0; i < size(tdVgdV); ++i) {
+                if (get<0>(tdKVcdKV(_0{}, i, _0{})) < actual_seqlen_k - n_block * kBlockN) {
+                    atomicAdd(reinterpret_cast<float*>(&tdVgdV(i)), static_cast<float>(tdVsdV(i)));
+                }
             }
         }
     }
@@ -821,10 +865,63 @@ void run_flash_bwd_multigroup(
             <<<grid, block, smem_size, stream>>>(params);
     } else {
         // Deterministic mode: two-pass reduction
-        // TODO Phase 3: Implement deterministic two-pass reduction
-        // 1. First pass: write per-group gradients to separate buffers
-        // 2. Second pass: reduction kernel sums across groups
-        throw std::runtime_error("Deterministic mode not yet implemented for multigroup backward");
+        // 1. First pass: write per-threadblock gradients to separate buffers
+        flash_bwd_multigroup_kernel<Kernel_traits, NumGroups, Is_causal, Is_local,
+                                     Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Is_dropout>
+            <<<grid, block, smem_size, stream>>>(params);
+
+        // Check for errors from first pass
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("First pass kernel failed: ") + cudaGetErrorString(err));
+        }
+
+        // 2. Second pass: reduction kernel sums from accumulation buffers to final outputs
+        // Only needed if accumulation buffers are separate from output buffers
+        if (params.dk_accum_ptr != nullptr && params.dv_accum_ptr != nullptr &&
+            params.dk_accum_ptr != params.dk_ptr && params.dv_accum_ptr != params.dv_ptr) {
+
+            // Calculate total number of thread blocks from first pass
+            const int total_tbs = num_n_blocks * params.batch_size * params.h;
+            const int elements_per_tb = Kernel_traits::kBlockN * Kernel_traits::kHeadDim;
+            const int total_elements_per_grad = max_seqlen_k * params.h_k * params.head_size;
+
+            // Launch reduction kernel for dK
+            const int threads_per_block = 256;
+            const int blocks_for_dk = (total_elements_per_grad + threads_per_block - 1) / threads_per_block;
+
+            using Element = typename Kernel_traits::Element;
+            using index_t = typename Kernel_traits::index_t;
+
+            reduce_multigroup_gradients_kernel<Element, index_t>
+                <<<blocks_for_dk, threads_per_block, 0, stream>>>(
+                    reinterpret_cast<Element*>(params.dk_ptr),
+                    reinterpret_cast<const Element*>(params.dk_accum_ptr),
+                    total_tbs,  // treated as num_groups for reduction
+                    max_seqlen_k,
+                    params.h_k,
+                    params.head_size
+                );
+
+            // Launch reduction kernel for dV
+            const int blocks_for_dv = (total_elements_per_grad + threads_per_block - 1) / threads_per_block;
+
+            reduce_multigroup_gradients_kernel<Element, index_t>
+                <<<blocks_for_dv, threads_per_block, 0, stream>>>(
+                    reinterpret_cast<Element*>(params.dv_ptr),
+                    reinterpret_cast<const Element*>(params.dv_accum_ptr),
+                    total_tbs,  // treated as num_groups for reduction
+                    max_seqlen_k,
+                    params.h_k,
+                    params.head_size
+                );
+
+            // Check for errors from reduction kernels
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                throw std::runtime_error(std::string("Reduction kernel failed: ") + cudaGetErrorString(err));
+            }
+        }
     }
 
     // Check for launch errors
