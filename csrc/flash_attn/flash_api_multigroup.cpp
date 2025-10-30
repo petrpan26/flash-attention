@@ -23,29 +23,30 @@
 #include "src/flash_bwd_multigroup_kernel.h"
 
 // Dispatcher macros (if not in static_switch.h)
+// Uses <= to round up to nearest supported head dimension
 #ifndef HEADDIM_SWITCH
 #define HEADDIM_SWITCH(HEADDIM, ...) \
     [&] { \
-        if (HEADDIM == 32) { \
+        if (HEADDIM <= 32) { \
             constexpr static int kHeadDim = 32; \
             __VA_ARGS__(); \
-        } else if (HEADDIM == 64) { \
+        } else if (HEADDIM <= 64) { \
             constexpr static int kHeadDim = 64; \
             __VA_ARGS__(); \
-        } else if (HEADDIM == 96) { \
+        } else if (HEADDIM <= 96) { \
             constexpr static int kHeadDim = 96; \
             __VA_ARGS__(); \
-        } else if (HEADDIM == 128) { \
+        } else if (HEADDIM <= 128) { \
             constexpr static int kHeadDim = 128; \
             __VA_ARGS__(); \
-        } else if (HEADDIM == 192) { \
+        } else if (HEADDIM <= 192) { \
             constexpr static int kHeadDim = 192; \
             __VA_ARGS__(); \
-        } else if (HEADDIM == 256) { \
+        } else if (HEADDIM <= 256) { \
             constexpr static int kHeadDim = 256; \
             __VA_ARGS__(); \
         } else { \
-            TORCH_CHECK(false, "Unsupported head dimension: ", HEADDIM); \
+            TORCH_CHECK(false, "Head dimension too large: ", HEADDIM, " (max 256)"); \
         } \
     }()
 #endif
