@@ -18,6 +18,84 @@
 #include "flash_multigroup.h"
 #include "static_switch.h"
 
+// Include kernel headers
+#include "src/flash_fwd_multigroup_kernel.h"
+#include "src/flash_bwd_multigroup_kernel.h"
+
+// Dispatcher macros (if not in static_switch.h)
+#ifndef HEADDIM_SWITCH
+#define HEADDIM_SWITCH(HEADDIM, ...) \
+    [&] { \
+        if (HEADDIM == 32) { \
+            constexpr static int kHeadDim = 32; \
+            __VA_ARGS__(); \
+        } else if (HEADDIM == 64) { \
+            constexpr static int kHeadDim = 64; \
+            __VA_ARGS__(); \
+        } else if (HEADDIM == 96) { \
+            constexpr static int kHeadDim = 96; \
+            __VA_ARGS__(); \
+        } else if (HEADDIM == 128) { \
+            constexpr static int kHeadDim = 128; \
+            __VA_ARGS__(); \
+        } else if (HEADDIM == 192) { \
+            constexpr static int kHeadDim = 192; \
+            __VA_ARGS__(); \
+        } else if (HEADDIM == 256) { \
+            constexpr static int kHeadDim = 256; \
+            __VA_ARGS__(); \
+        } else { \
+            TORCH_CHECK(false, "Unsupported head dimension: ", HEADDIM); \
+        } \
+    }()
+#endif
+
+#ifndef NUMGROUPS_SWITCH
+#define NUMGROUPS_SWITCH(NUMGROUPS, ...) \
+    [&] { \
+        if (NUMGROUPS == 1) { \
+            constexpr static int kNumGroups = 1; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 2) { \
+            constexpr static int kNumGroups = 2; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 3) { \
+            constexpr static int kNumGroups = 3; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 4) { \
+            constexpr static int kNumGroups = 4; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 5) { \
+            constexpr static int kNumGroups = 5; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 6) { \
+            constexpr static int kNumGroups = 6; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 7) { \
+            constexpr static int kNumGroups = 7; \
+            __VA_ARGS__(); \
+        } else if (NUMGROUPS == 8) { \
+            constexpr static int kNumGroups = 8; \
+            __VA_ARGS__(); \
+        } else { \
+            TORCH_CHECK(false, "Unsupported number of groups: ", NUMGROUPS); \
+        } \
+    }()
+#endif
+
+#ifndef BOOL_SWITCH
+#define BOOL_SWITCH(COND, CONST_NAME, ...) \
+    [&] { \
+        if (COND) { \
+            constexpr static bool CONST_NAME = true; \
+            __VA_ARGS__(); \
+        } else { \
+            constexpr static bool CONST_NAME = false; \
+            __VA_ARGS__(); \
+        } \
+    }()
+#endif
+
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -388,26 +466,42 @@ mha_varlen_multigroup_fwd(
     // Get CUDA stream
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    // TODO: Dispatch to kernel - for now, throw error
-    TORCH_CHECK(false, "Multi-group forward kernel not yet implemented. "
-                       "Please implement Phase 2 CUDA kernels first.");
-
-    // Once kernels are implemented, use:
-    // HEADDIM_SWITCH(head_size, [&] {
-    //     NUMGROUPS_SWITCH(num_groups, [&] {
-    //         BOOL_SWITCH(is_causal, Is_causal, [&] {
-    //             if (params.is_bf16) {
-    //                 run_mha_fwd_multigroup<cutlass::bfloat16_t, kHeadDim, kNumGroups, Is_causal>(
-    //                     params, stream
-    //                 );
-    //             } else {
-    //                 run_mha_fwd_multigroup<cutlass::half_t, kHeadDim, kNumGroups, Is_causal>(
-    //                     params, stream
-    //                 );
-    //             }
-    //         });
-    //     });
-    // });
+    // Dispatch to kernel based on head_size, num_groups, and dtype
+    HEADDIM_SWITCH(head_size, [&] {
+        NUMGROUPS_SWITCH(num_groups, [&] {
+            BOOL_SWITCH(is_causal, Is_causal, [&] {
+                if (params.is_bf16) {
+                    if constexpr (kHeadDim == 32) {
+                        run_mha_fwd_multigroup_hdim32<cutlass::bfloat16_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 64) {
+                        run_mha_fwd_multigroup_hdim64<cutlass::bfloat16_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 96) {
+                        run_mha_fwd_multigroup_hdim96<cutlass::bfloat16_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 128) {
+                        run_mha_fwd_multigroup_hdim128<cutlass::bfloat16_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 192) {
+                        run_mha_fwd_multigroup_hdim192<cutlass::bfloat16_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 256) {
+                        run_mha_fwd_multigroup_hdim256<cutlass::bfloat16_t, kNumGroups, Is_causal>(params, stream);
+                    }
+                } else {
+                    if constexpr (kHeadDim == 32) {
+                        run_mha_fwd_multigroup_hdim32<cutlass::half_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 64) {
+                        run_mha_fwd_multigroup_hdim64<cutlass::half_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 96) {
+                        run_mha_fwd_multigroup_hdim96<cutlass::half_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 128) {
+                        run_mha_fwd_multigroup_hdim128<cutlass::half_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 192) {
+                        run_mha_fwd_multigroup_hdim192<cutlass::half_t, kNumGroups, Is_causal>(params, stream);
+                    } else if constexpr (kHeadDim == 256) {
+                        run_mha_fwd_multigroup_hdim256<cutlass::half_t, kNumGroups, Is_causal>(params, stream);
+                    }
+                }
+            });
+        });
+    });
 
     // Cleanup (caller manages pointer lifetime)
 

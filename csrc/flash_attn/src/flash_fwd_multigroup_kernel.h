@@ -940,6 +940,43 @@ void run_mha_fwd_multigroup_hdim128(Flash_fwd_multigroup_params &params, cudaStr
     run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
 }
 
+template<typename T, int NumGroups, bool Is_causal>
+void run_mha_fwd_multigroup_hdim32(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 32;
+    // For NumGroups=2: kBlockM=64, kBlockN=128
+    // Shared memory: 2 * 64 * 32 * 2 + 2 * 128 * 32 * 2 = 8KB + 16KB = 24KB ✓
+    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
+    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+}
+
+template<typename T, int NumGroups, bool Is_causal>
+void run_mha_fwd_multigroup_hdim96(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 96;
+    // For NumGroups=2: kBlockM=64, kBlockN=128
+    // Shared memory: 2 * 64 * 96 * 2 + 2 * 128 * 96 * 2 = 24KB + 48KB = 72KB ✓
+    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
+    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+}
+
+template<typename T, int NumGroups, bool Is_causal>
+void run_mha_fwd_multigroup_hdim192(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 192;
+    // For NumGroups=2: kBlockM=64, kBlockN=128
+    // Shared memory: 2 * 64 * 192 * 2 + 2 * 128 * 192 * 2 = 48KB + 96KB = 144KB ✓
+    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 64, 128, 4, NumGroups, false, false, T>;
+    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+}
+
+template<typename T, int NumGroups, bool Is_causal>
+void run_mha_fwd_multigroup_hdim256(Flash_fwd_multigroup_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 256;
+    // For NumGroups=2: kBlockM=64, kBlockN=128
+    // Shared memory: 2 * 64 * 256 * 2 + 2 * 128 * 256 * 2 = 64KB + 128KB = 192KB ✗ (exceeds A100 limit)
+    // Reduce kBlockM to 32 for d=256
+    using Kernel_traits = Flash_fwd_multigroup_kernel_traits<Headdim, 32, 128, 4, NumGroups, false, false, T>;
+    run_flash_fwd_multigroup<Kernel_traits, NumGroups, Is_causal>(params, stream);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Notes for Implementation
 ////////////////////////////////////////////////////////////////////////////////////////////////////
